@@ -6,7 +6,7 @@ Nests DXF parts onto stock sheets (rectangular / bounding-box nesting) and
 automatically splits parts that are too long for any sheet into weldable
 segments, keeping seams away from internal features and notches.
 
-Requires:  pip install ezdxf shapely
+Requires:  pip install ezdxf shapely reportlab
 Run:       python tannest.py
 
 How it works (short version):
@@ -1059,6 +1059,11 @@ def sheet_filename(i, b):
 
 
 def write_outputs(res, st, folder):
+    # Fail before writing DXFs if PDF support is unavailable.
+    try:
+        import reportlab
+    except ImportError as ex:
+        raise RuntimeError("PDF export requires ReportLab. Install with: pip install reportlab") from ex
     os.makedirs(folder, exist_ok=True)
     units = res.preps[0].part.units
     written = []
@@ -1109,8 +1114,11 @@ def write_outputs(res, st, folder):
         written.append(fn)
 
     fn = os.path.join(folder, "Nest_Report.txt")
-    with open(fn, "w") as f:
+    with open(fn, "w", encoding="utf-8") as f:
         f.write(report_text(res, st))
+    written.append(fn)
+    fn = os.path.join(folder, "Nest_Report.pdf")
+    write_pdf_report(res, st, fn)
     written.append(fn)
     return written
 
@@ -1211,6 +1219,279 @@ def report_text(res, st):
                 L.append("      weld length per seam: " + ", ".join(f"{x:.3f}" for x in sl) +
                          (f"   (x{pr.part.qty} parts)" if pr.part.qty > 1 else ""))
     return "\n".join(L) + "\n"
+
+
+def write_pdf_report(res, st, filename, report_note=None):
+    """Render the chosen Result without rerunning or changing the optimizer.
+
+    ReportLab is loaded only for export, so the GUI still opens without it.
+    report_note is optional provenance for a demonstration or externally run job.
+    """
+    from collections import Counter
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable,
+    )
+
+    navy = colors.HexColor('#17344A')
+    teal = colors.HexColor('#087E8B')
+    pale = colors.HexColor('#EDF4F7')
+    gray = colors.HexColor('#536574')
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle('ReportTitle', fontName='Helvetica-Bold', fontSize=26,
+                              leading=30, textColor=navy, spaceAfter=12))
+    styles.add(ParagraphStyle('Section', fontName='Helvetica-Bold', fontSize=14,
+                              leading=18, textColor=navy, spaceBefore=12,
+                              spaceAfter=8, keepWithNext=True))
+    styles.add(ParagraphStyle('Cell', fontSize=8, leading=11, textColor=navy,
+                              splitLongWords=True))
+    styles.add(ParagraphStyle('SmallNote', fontSize=8, leading=11, textColor=gray,
+                              spaceAfter=7))
+    styles.add(ParagraphStyle('Money', parent=styles['Cell'], alignment=TA_RIGHT))
+    styles.add(ParagraphStyle('White', parent=styles['Cell'], textColor=colors.white,
+                              fontName='Helvetica-Bold'))
+    story = []
+    cm, c = res.model, res.cost
+    unit = UNIT_NAMES.get(res.preps[0].part.units, 'unknown')
+    width = letter[0] - 84
+
+    def p(value, style='Cell'):
+        return Paragraph(escape(str(value)).replace('\n', '<br/>'), styles[style])
+
+    def note(value):
+        story.append(p(value, 'SmallNote'))
+
+    def heading(value):
+        story.append(p(value, 'Section'))
+
+    def table(headers, rows, widths, right=()):
+        data = [[p(h, 'White') for h in headers]]
+        for row in rows:
+            data.append([p(v, 'Money' if i in right else 'Cell')
+                         for i, v in enumerate(row)])
+        t = Table(data, colWidths=[width * x for x in widths], repeatRows=1,
+                  hAlign='LEFT')
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), navy),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, pale]),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 7),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 7),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('LINEBELOW', (0, -1), (-1, -1), .5, colors.HexColor('#CFDBE2')),
+        ]))
+        story.extend([t, Spacer(1, 9)])
+
+    class Diagram(Flowable):
+        """Vector geometry, using the same flattened paths as the GUI preview."""
+        def __init__(self, paths, bounds, labels=(), seams=()):
+            super().__init__()
+            self.width, self.height = width, 210
+            self.paths, self.bounds = paths, bounds
+            self.labels, self.seams = labels, seams
+
+        def draw(self):
+            cv = self.canv
+            x0, y0, x1, y1 = self.bounds
+            scale = min((self.width - 28) / max(x1 - x0, EPS),
+                        (self.height - 28) / max(y1 - y0, EPS))
+            ox = (self.width - (x1 - x0) * scale) / 2
+            oy = (self.height - (y1 - y0) * scale) / 2
+
+            def point(x, y):
+                return ox + (x - x0) * scale, oy + (y - y0) * scale
+
+            cv.saveState()
+            for layer, pts in self.paths:
+                if not pts:
+                    continue
+                cv.setStrokeColor({'OUTSIDE': navy, 'COMMON_LINE': colors.HexColor('#BA453B'),
+                                   'HOLES': colors.HexColor('#248244'),
+                                   'SHEET_REF_NOCUT': colors.HexColor('#9AA9B4')}[layer])
+                cv.setLineWidth(.6)
+                path = cv.beginPath()
+                path.moveTo(*point(*pts[0]))
+                for pt in pts[1:]:
+                    path.lineTo(*point(*pt))
+                path.close()
+                cv.drawPath(path)
+            cv.setStrokeColor(teal)
+            cv.setDash(4, 3)
+            for a, b in self.seams:
+                cv.line(*point(*a), *point(*b))
+            cv.setDash()
+            for label, x, y in self.labels:
+                px, py = point(x, y)
+                cv.setFillColor(colors.white)
+                cv.setStrokeColor(teal)
+                cv.circle(px, py, 8, stroke=1, fill=1)
+                cv.setFillColor(navy)
+                cv.setFont('Helvetica-Bold', 7)
+                cv.drawCentredString(px, py - 2.5, str(label))
+            cv.restoreState()
+
+    story.append(p('TANNest | Nest report', 'ReportTitle'))
+    note(time.strftime('Generated %Y-%m-%d at %H:%M') + ' | DRAFT - review before cutting')
+    if report_note:
+        note(report_note)
+    table(['Estimated total', 'Stock sheets', 'Finished seams', 'Net plate utilization'],
+          [[_usd(c['total']), str(len(res.bins)),
+            f"{res.n_seams} / {c['weld_ft']:,.2f} ft",
+            f"{100 * res.net_area / max(c['area'], EPS):.1f}%"]], [.25]*4)
+    note('Estimate = plate cost - remnant credit + welding. Other fabrication costs are not included.')
+    if not cm.priced:
+        note('NO PRICES ENTERED: the optimizer selected by sheet area. Dollar values are unpriced, not a free job.')
+    units = {pr.part.units for pr in res.preps}
+    if len(units) > 1:
+        note('WARNING: mixed DXF units: ' + ', '.join(UNIT_NAMES.get(x, str(x)) for x in sorted(units)))
+    for n in res.notes:
+        note('OPTIMIZER NOTE: ' + n)
+    note('Verify every sheet in CAM; obtain engineering review of structural or pressure-bearing seams.')
+    heading('Cost and material balance')
+    part_lb = res.net_area * cm.lb_per_area
+    table(['Item', 'Quantity', 'Amount'], [
+        ['Plate purchased', f"{c['sheet_lb']:,.1f} lb", _usd(c['material'])],
+        ['Net parts (including shared-cutline parts)', f'{part_lb:,.1f} lb', 'Included in plate'],
+        ['Usable remnant credit', f"{c['rem_lb']:,.1f} lb", '-' + _usd(c['credit'])],
+        ['Scrap / skeleton', f"{c['sheet_lb'] - part_lb - c['rem_lb']:,.1f} lb", 'Included in plate'],
+        ['Welding', f"{c['weld_ft']:,.2f} ft", _usd(c['weld'])],
+        ['ESTIMATED TOTAL', '', _usd(c['total'])],
+    ], [.53, .22, .25], right=(1, 2))
+    heading('Stock to purchase')
+    counts = Counter(b.sheet for b in res.bins)
+    table([f'Width x length ({unit})', 'Sheets', 'Plate weight (lb)', 'Plate cost'],
+          [[f'{w:g} x {l:g}', n, f'{n*w*l*cm.lb_per_area:,.1f}',
+            _usd(n*w*l*cm.usd_per_area)] for (w, l), n in sorted(counts.items())],
+          [.34, .12, .27, .27], right=(1, 2, 3))
+    heading('Job inputs')
+    table(['Part / source DXF', 'Qty', f'Original size ({unit})', 'Options'],
+          [[pr.part.name + '\n' + os.path.basename(pr.part.file), pr.part.qty,
+            f'{pr.part.size[0]:.3f} x {pr.part.size[1]:.3f}',
+            ('Profile only' if pr.part.profile_only else 'All features') +
+            f"; rotate {'yes' if pr.part.allow_rotate else 'no'}; split {'yes' if pr.part.allow_split else 'no'}"]
+           for pr in res.preps], [.36, .08, .24, .32])
+
+    story.append(PageBreak())
+    heading('Settings and layout comparison')
+    note(f'{res.attempts} layouts tried in {res.seconds:.1f} seconds. Heuristic search; global optimum not proven.')
+    table(['Setting', 'Value', 'Setting', 'Value'], [
+        ['Thickness', f'{st.thickness:g} in', 'Density', f'{st.density:g} lb/in^3'],
+        ['Material price', _usd(st.material_cost_lb) + '/lb', 'Finished weld price', _usd(st.weld_cost_ft) + '/ft'],
+        ['Remnant credit', f'{st.remnant_credit:g}%', 'Minimum remnant', f'{st.min_remnant:g} in'],
+        ['Edge border', f'{st.border:g} {unit}', 'Part spacing', f'{st.spacing:g} {unit}'],
+        ['Seam clearance', f'{st.seam_clear:g} {unit}', 'Min segment', f'{st.min_seg:g} {unit}'],
+        ['Seam rounding', f'{st.seam_step:g} {unit}', 'Avoid notches', str(st.avoid_notches)],
+        ['Arc tolerance', f'{st.flatten_tol:g} {unit}', 'Join tolerance', f'{st.join_tol:g} {unit}'],
+        ['Search effort', st.effort, 'Scoring', 'Cost' if cm.priced else 'Sheet area'],
+    ], [.24, .26, .24, .26])
+    note('Material grade is not stored in the result; thickness and density above are the actual costing inputs.')
+    heading('Alternatives retained by the optimizer')
+    note(f'Area is in {unit} squared (drawing units). This is the optimizer\'s filtered trade-off list, not every attempted layout.')
+    if res.tradeoff:
+        table(['Seams / choice', 'Sheets', f'Area ({unit}^2)', 'Plate', 'Weld', 'Credit', 'Total'],
+              [[str(ns) + (' - chosen' if ns == res.n_seams and abs(ev['area']-c['area']) < EPS else ''),
+                nb, f"{ev['area']:,.0f}", _usd(ev['material']), _usd(ev['weld']),
+                _usd(ev['credit']), _usd(ev['total'])] for ns, nb, ev in res.tradeoff],
+              [.16, .08, .15, .16, .14, .14, .17], right=(1, 2, 3, 4, 5, 6))
+    else:
+        note('No alternative layouts were retained.')
+    # Preserve the legacy plate-only break-even explanation, explicitly scoped.
+    if res.tradeoff and len(res.tradeoff) >= 2:
+        (n1, _, e1), (n2, _, e2) = res.tradeoff[:2]
+        da, df = e1['area'] - e2['area'], e2['weld_ft'] - e1['weld_ft']
+        if da > EPS and df > EPS:
+            lb = da * cm.lb_per_area
+            note(f'Plate-only break-even, {n1} to {n2} seams: saves {lb:,.1f} lb for {df:,.2f} ft '
+                 f'more weld ({lb/df:,.2f} lb per weld foot; {_usd(lb/df*st.material_cost_lb)}/ft). '
+                 'This legacy comparison excludes changes in remnant credit; use the totals above for the full comparison.')
+
+    for i, b in enumerate(res.bins, 1):
+        story.append(PageBreak())
+        W, L = b.sheet
+        heading(f'Sheet {i:02d} | {W:g} x {L:g} {unit}')
+        note('Cut file: ' + sheet_filename(i, b))
+        note(f'Plate: {W*L*cm.lb_per_area:,.1f} lb | {_usd(W*L*cm.usd_per_area)}. '
+             'Origin: lower left; X along sheet length, Y along width.')
+        paths = [('SHEET_REF_NOCUT', [(0, 0), (L, 0), (L, W), (0, W)])] + placed_geometry(b, st)
+        labels = [(j, st.border+x+(it.h if r else it.w)/2,
+                   st.border+y+(it.w if r else it.h)/2)
+                  for j, (it, x, y, r) in enumerate(b.placed, 1)]
+        story.append(Diagram(paths, (0, 0, L, W), labels))
+        note('Preview only, not a cutting template. Navy: outside | red: shared cut | green: hole. Numbers match the table.')
+        table(['ID / part', f'Local size ({unit})', f'X / Y ({unit})', 'Rotation'],
+              [[f'{j}. {it.name}', f'{it.w:.3f} x {it.h:.3f}',
+                f'{st.border+x:.3f} / {st.border+y:.3f}', '90 deg' if r else '0 deg']
+               for j, (it, x, y, r) in enumerate(b.placed, 1)], [.40, .24, .23, .13])
+        note('Local size is before sheet rotation. X/Y locates the placed bounding box. Rotation is relative to the normalized part.')
+        maxx = max((st.border+x+(it.h if r else it.w) for it, x, y, r in b.placed), default=0)
+        note(f'End space past last part: {L-maxx:.3f} {unit} (before spacing allowance; not all end space qualifies for credit).')
+        remnants = cm.remnants(b)
+        if remnants:
+            table([f'Usable strip length x width ({unit})', 'Weight (lb)', 'Credit'],
+                  [[f'{l:.3f} x {w:.3f}', f'{l*w*cm.lb_per_area:,.1f}',
+                    _usd(l*w*cm.usd_per_area*st.remnant_credit/100)] for l, w in remnants],
+                  [.50, .25, .25], right=(1, 2))
+        else:
+            note('No strips qualify as usable remnants under the current settings.')
+
+    for pr in res.preps:
+        story.append(PageBreak())
+        name = pr.part.name
+        seams = res.seams.get(name, [])
+        heading(f'Wall / part detail | {name}')
+        note(f'Quantity: {pr.part.qty}. Coordinates below refer to the original DXF. '
+             f'Normalized long axis: {"negative original Y" if pr.rotated0 else "positive original X"}.')
+        inv = Matrix44(pr.M0)
+        inv.inverse()
+        lines = [xform_pts(inv, [(s, 0), (s, pr.H)]) for s in seams]
+        paths = [('OUTSIDE', pr.part.outer.pts)] + [(ly, lp.pts) for lp, ly, _ in pr.inner]
+        story.append(Diagram(paths, pr.part.outer.poly.bounds, seams=lines))
+        note('Dashed teal lines show seam positions; preview only. Dimensions and coordinates are in ' + unit + '.')
+        if seams:
+            note('Seam reference file: SeamMap_' + _safe(name) + '.dxf')
+            table(['Seam', 'Original coordinate', f'Weld length / copy ({unit})'],
+                  [[j, seam_label(pr, s), f'{sl:.3f}']
+                   for j, (s, sl) in enumerate(zip(seams, res.seam_len[name]), 1)], [.12, .50, .38])
+            edges = [0.0] + list(seams) + [pr.W]
+            table(['Interval along normalized long axis', f'Interval length ({unit})'],
+                  [[f'{a:.3f} to {b:.3f}', f'{b-a:.3f}'] for a, b in zip(edges, edges[1:])], [.65, .35])
+            note('Intervals describe split spans. Irregular outlines can produce multiple pieces within a span; use the actual piece list below.')
+        else:
+            note('No seams: this part is placed whole.')
+        table(['Actual piece / instance', 'Sheet', f'Local piece size ({unit})'],
+              [[it.name, f'{i:02d}', f'{it.w:.3f} x {it.h:.3f}']
+               for i, b in enumerate(res.bins, 1) for it, _, _, _ in b.placed if it.prep is pr],
+              [.55, .12, .33])
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor('#CFDBE2'))
+        canvas.line(42, 36, letter[0]-42, 36)
+        canvas.setFillColor(gray)
+        canvas.setFont('Helvetica', 8)
+        canvas.drawString(42, 24, 'TANNest | DRAFT - verify in CAM before cutting')
+        canvas.drawRightString(letter[0]-42, 24, f'Page {doc.page}')
+        canvas.restoreState()
+
+    # Build beside the destination; only replace an existing report after success.
+    import tempfile
+    fd, temp = tempfile.mkstemp(suffix='.pdf', dir=os.path.dirname(os.path.abspath(filename)))
+    os.close(fd)
+    try:
+        doc = SimpleDocTemplate(temp, pagesize=letter, rightMargin=42, leftMargin=42,
+                                topMargin=38, bottomMargin=48,
+                                title='TANNest Nest Report', author='TANNest')
+        doc.build(story, onFirstPage=footer, onLaterPages=footer)
+        os.replace(temp, filename)
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
+
 
 
 # ============================================================================
@@ -1401,7 +1682,7 @@ def run_gui(test_hook=None):
             ttk.Button(br, text="Remove", command=self._del_part).pack(side="left", padx=2)
             self.b_run = ttk.Button(br, text="Optimize", command=self._run)
             self.b_run.pack(side="right")
-            self.b_export = ttk.Button(br, text="Export DXFs...", command=self._export, state="disabled")
+            self.b_export = ttk.Button(br, text="Export DXFs + PDF...", command=self._export, state="disabled")
             self.b_export.pack(side="right", padx=4)
 
             pr = ttk.Frame(right)

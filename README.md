@@ -26,7 +26,7 @@ Layouts are scored in dollars: plate cost, minus credit for usable remnants, plu
 
 ## Installation
 
-TANNest is a single Python file. It needs Python 3.10 or newer and two libraries: **ezdxf** (DXF reading/writing) and **shapely** (geometry).
+TANNest is a single Python file. It needs Python 3.10 or newer and three libraries: **ezdxf** (DXF reading/writing), **shapely** (geometry), and **reportlab** (PDF reports).
 
 ### Windows
 
@@ -35,7 +35,7 @@ TANNest is a single Python file. It needs Python 3.10 or newer and two libraries
 3. Open **Command Prompt** and install the libraries:
 
    ```
-   pip install ezdxf shapely
+   pip install ezdxf shapely reportlab
    ```
 
 4. Copy `tannest.py` to a folder of your choice, for example `C:\Tools\TANNest\`.
@@ -57,7 +57,7 @@ pythonw.exe "C:\Tools\TANNest\tannest.py"
 
 ```
 sudo apt install python3-tk
-pip install ezdxf shapely          # add --break-system-packages on newer Ubuntu, or use a venv
+pip install ezdxf shapely reportlab          # add --break-system-packages on newer Ubuntu, or use a venv
 python3 tannest.py
 ```
 
@@ -67,7 +67,7 @@ If the window opens and shows the default sheet list, you're set. If you get `Mo
 
 | Missing module | Fix |
 |---|---|
-| `ezdxf` or `shapely` | Rerun `pip install ezdxf shapely` |
+| `ezdxf`, `shapely`, or `reportlab` | Rerun `pip install ezdxf shapely reportlab` |
 | `tkinter` (Windows) | Rerun the Python installer, choose Modify, and enable tcl/tk |
 | `tkinter` (Linux) | `sudo apt install python3-tk` |
 
@@ -87,7 +87,7 @@ If the window opens and shows the default sheet list, you're set. If you get `Mo
    - red lines are shared cut lines
    - green lines are holes
 6. **Check the Report / Log tab** for cost, seam locations, and the trade-off table.
-7. **Export DXFs...** and pick an output folder.
+7. **Export DXFs + PDF...** and pick an output folder.
 
 ---
 
@@ -178,12 +178,13 @@ The layout with the lowest total wins. Ties go to less sheet area, then fewer se
 
 ## Output files
 
-**Export DXFs...** writes these files to the folder you choose:
+**Export DXFs + PDF...** writes these files to the folder you choose:
 
 | File | Contents |
 |---|---|
 | `Sheet01_72x144_WallA-S1.dxf`, ... | One file per sheet. Sheet origin is at the lower left (0,0); length runs along X. |
 | `SeamMap_<part>.dxf` | Each split part in its original coordinates, with seam lines and labels on `SEAM_REF` |
+| `Nest_Report.pdf` | Formatted summary, costs, stock purchase list, settings, trade-offs, sheet previews and placement tables, and wall seam diagrams with piece-to-sheet mapping |
 | `Nest_Report.txt` | The same report shown in the Report / Log tab |
 
 **Layers in the sheet files:**
@@ -270,3 +271,28 @@ Saving a SheetCam job template with these three layer operations makes every TAN
 ---
 
 *TANNest is an internal tool for TANN Corporation. Output is a draft for review before cutting.*
+
+## PDF report update
+
+The application remains a single Python file. Replace TANNest.py and install ReportLab using the command above. Export writes both Nest_Report.pdf and the legacy Nest_Report.txt alongside the existing DXFs. The Report / Log tab remains plain text.
+
+PDF totals come directly from the selected optimizer result. Sheet weights and remnant credits use the existing CostModel. Geometry comes from the same placement transforms and flattened paths as the preview. The optimizer, cut geometry, and DXF export logic are unchanged.
+
+Report conventions:
+- US Letter portrait, selectable text, vector diagrams, repeated table headers, and page numbers.
+- Dimensions and trade-off areas use DXF drawing units; weight is pounds, weld totals are feet, and thickness is inches.
+- Plate utilization is net part area divided by purchased sheet area; shared-cutline parts remain included as in the existing report.
+- Original seam coordinates match the SeamMap DXF. Sheet placements reference the lower-left bounding box after rotation.
+- The legacy break-even estimate is explicitly labeled plate-only because it excludes remnant-credit changes.
+- Material grade is not retained by the existing result object; the PDF reports the actual thickness and density instead of guessing a grade.
+- Very long jobs flow to additional pages. A PDF write failure is reported by the existing export error dialog; earlier DXF/text files may already have been written. The previous PDF is replaced only after a successful build.
+
+The included sample uses one copy of each supplied wall, default stock sizes and geometry settings, 0.25-inch plate, density 0.2836 lb/in^3, and illustrative prices of $1.00/lb, $12.00/ft welding, and 25% remnant credit. These are demonstration assumptions, not a shop quote.
+
+### Verification included with this update
+
+Run `python -m unittest test_pdf_report -v` from the extracted folder. Four checks cover complete export without result mutation, preservation of an existing PDF if rendering fails, unpriced jobs with long names and quantities, and metric drawings with original-coordinate rotation.
+
+The supplied three-wall sample was also compared against the original uploaded program: costs, seams, placed geometry, and exported DXF entities matched. All 13 sample PDF pages were rendered and visually inspected. The desktop GUI was not exercised interactively; its export handler uses the tested write_outputs function.
+
+Run `python make_sample_report.py` to regenerate the demonstration PDF. The sample is a report/export check, not validation of nesting optimality or production cutting accuracy.
