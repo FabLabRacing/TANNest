@@ -26,7 +26,7 @@ Layouts are scored in dollars: plate cost, minus credit for usable remnants, plu
 
 ## Installation
 
-TANNest is a single Python file. It needs Python 3.10 or newer and three libraries: **ezdxf** (DXF reading/writing), **shapely** (geometry), and **reportlab** (PDF reports).
+TANNest is a single Python file. It needs Python 3.10 or newer and three libraries: **ezdxf** (DXF reading/writing), **shapely** (geometry) and **reportlab** (PDF report). The app opens without reportlab, but export stops with a message until it is installed.
 
 ### Windows
 
@@ -57,7 +57,7 @@ pythonw.exe "C:\Tools\TANNest\tannest.py"
 
 ```
 sudo apt install python3-tk
-pip install ezdxf shapely reportlab          # add --break-system-packages on newer Ubuntu, or use a venv
+pip install ezdxf shapely reportlab   # add --break-system-packages on newer Ubuntu, or use a venv
 python3 tannest.py
 ```
 
@@ -67,7 +67,7 @@ If the window opens and shows the default sheet list, you're set. If you get `Mo
 
 | Missing module | Fix |
 |---|---|
-| `ezdxf`, `shapely`, or `reportlab` | Rerun `pip install ezdxf shapely reportlab` |
+| `ezdxf`, `shapely` or `reportlab` | Rerun `pip install ezdxf shapely reportlab` |
 | `tkinter` (Windows) | Rerun the Python installer, choose Modify, and enable tcl/tk |
 | `tkinter` (Linux) | `sudo apt install python3-tk` |
 
@@ -138,14 +138,16 @@ All lengths are in drawing units, which is normally inches.
 | Edge border | 0.375 | Minimum distance from any part to the sheet edge |
 | Part spacing | 1.0 | Minimum distance between parts on the same sheet |
 | Seam clearance | 2.0 | Minimum distance from a seam to any internal feature or notch |
+| Corner clearance | 2.0 | Minimum distance from a seam to any inside (concave) corner of the outline. Set this from your weld practice; it is checked separately from feature clearance. |
 | Min segment length | 6.0 | Shortest piece a split is allowed to produce |
 | Seam rounding step | 0.0625 | Seams land on multiples of this (1/16"). Use 0 for exact positions. |
 | Arc flatten tol. | 0.005 | Chord tolerance when an arc has to become a polyline (only on split segment outlines) |
 | Endpoint join tol. | 0.005 | How close two line ends must be to count as connected. Raise it slightly for sloppy drawings. |
-| Search effort | 400 | How many layouts to try. Higher is slower and sometimes better. |
-| Keep seams out of notches | on | Seams avoid notches and other concave areas of the outline. If no layout can do that, a note in the report says so. |
+| Search effort | 400 | Base search effort. It is scaled up automatically with the number of parts and seam options, so big jobs get a more thorough search. Raise it if results change noticeably between runs. |
+| Time limit (s) | 60 | The search stops at this limit whatever the effort; the report notes it if that happened. |
+| Keep seams out of notches | on | Seams stay out of notches: concave cut-outs shorter than 25% of the part's length. Longer concave areas (a narrowed middle section, long side reliefs) are treated as part of the shape, so only their corners are kept clear. If no layout can avoid a notch, seams may cross it but inside corners are still kept clear; only as a last resort are corners given up, with a warning. |
 
-Settings and the sheet list are saved when you close the app. The file is `.dxf_sheet_nester.json` in your user folder, unless you changed `CONFIG_PATH` in the script.
+Settings and the sheet list are saved when you close the app. The file is `.tannest.json` in your user folder.
 
 ---
 
@@ -184,8 +186,8 @@ The layout with the lowest total wins. Ties go to less sheet area, then fewer se
 |---|---|
 | `Sheet01_72x144_WallA-S1.dxf`, ... | One file per sheet. Sheet origin is at the lower left (0,0); length runs along X. |
 | `SeamMap_<part>.dxf` | Each split part in its original coordinates, with seam lines and labels on `SEAM_REF` |
-| `Nest_Report.pdf` | Formatted summary, costs, stock purchase list, settings, trade-offs, sheet previews and placement tables, and wall seam diagrams with piece-to-sheet mapping |
 | `Nest_Report.txt` | The same report shown in the Report / Log tab |
+| `Nest_Report.pdf` | Formatted report: summary, cost and material balance, stock to purchase, job inputs, settings, alternatives and break-even table, one page per sheet with a numbered layout drawing and remnant credits, and one page per part with its seams and where each piece was cut |
 
 **Layers in the sheet files:**
 
@@ -232,7 +234,7 @@ Saving a SheetCam job template with these three layer operations makes every TAN
   - weld feet and $
   - total
 - **Trade-off table**: the best layout found at each seam count, priced at your settings, with the chosen one marked. Use it to see what fewer or more seams would have cost.
-- **Break-even line**: the weld price per foot at which the extra seams stop paying for themselves.
+- **Break-even for each step**: for every step in the trade-off table, the plate saved per foot of extra weld and the weld price below which those extra seams pay off. The app itself picks the layout by comparing totals directly; the steps are there so you can see how sensitive the choice is to your weld rate.
 - **Per sheet**:
   - size, weight and cost
   - remnant length past the last part
@@ -263,7 +265,9 @@ Saving a SheetCam job template with these three layer operations makes every TAN
 | Part shows the wrong size | Stray geometry in the file (title block, dimension lines drawn as lines). Clean the DXF down to cut geometry. |
 | *too wide for every enabled sheet* | The part's short side doesn't fit any enabled sheet minus the borders. Enable a wider sheet or check the drawing. |
 | *could not place seams clear of internal features* | Features are packed too closely for the seam clearance. Lower Seam clearance or Min segment length, or enable longer sheets. |
-| *no seam layout avoids the notches* | The run still completed, but a seam may cross a notch. Check the SeamMap DXF. |
+| *no seam layout avoids the notches* | The run still completed; a seam may cross a notch, but inside corners are still kept at Corner clearance. Check the SeamMap DXF. |
+| *WARNING no seam layout keeps clear of inside corners* | Last-resort fallback: a seam may sit close to an inside corner. Check the SeamMap DXF, then lower Corner clearance deliberately or review the part with engineering. |
+| *search stopped at the time limit* | Large job; raise Time limit (s) for a more thorough search. |
 | Costs are all $0.00 | Prices aren't set, so the layout was scored by sheet area. Enter Material $/lb and Weld $/ft. |
 | Mixed units warning | Parts were drawn in different units. Redraw or convert so every part uses the same units. |
 | Window too small or settings cut off | Enlarge the window; the minimum size is 1000 x 650. |
@@ -271,28 +275,3 @@ Saving a SheetCam job template with these three layer operations makes every TAN
 ---
 
 *TANNest is an internal tool for TANN Corporation. Output is a draft for review before cutting.*
-
-## PDF report update
-
-The application remains a single Python file. Replace TANNest.py and install ReportLab using the command above. Export writes both Nest_Report.pdf and the legacy Nest_Report.txt alongside the existing DXFs. The Report / Log tab remains plain text.
-
-PDF totals come directly from the selected optimizer result. Sheet weights and remnant credits use the existing CostModel. Geometry comes from the same placement transforms and flattened paths as the preview. The optimizer, cut geometry, and DXF export logic are unchanged.
-
-Report conventions:
-- US Letter portrait, selectable text, vector diagrams, repeated table headers, and page numbers.
-- Dimensions and trade-off areas use DXF drawing units; weight is pounds, weld totals are feet, and thickness is inches.
-- Plate utilization is net part area divided by purchased sheet area; shared-cutline parts remain included as in the existing report.
-- Original seam coordinates match the SeamMap DXF. Sheet placements reference the lower-left bounding box after rotation.
-- The legacy break-even estimate is explicitly labeled plate-only because it excludes remnant-credit changes.
-- Material grade is not retained by the existing result object; the PDF reports the actual thickness and density instead of guessing a grade.
-- Very long jobs flow to additional pages. A PDF write failure is reported by the existing export error dialog; earlier DXF/text files may already have been written. The previous PDF is replaced only after a successful build.
-
-The included sample uses one copy of each supplied wall, default stock sizes and geometry settings, 0.25-inch plate, density 0.2836 lb/in^3, and illustrative prices of $1.00/lb, $12.00/ft welding, and 25% remnant credit. These are demonstration assumptions, not a shop quote.
-
-### Verification included with this update
-
-Run `python -m unittest test_pdf_report -v` from the extracted folder. Four checks cover complete export without result mutation, preservation of an existing PDF if rendering fails, unpriced jobs with long names and quantities, and metric drawings with original-coordinate rotation.
-
-The supplied three-wall sample was also compared against the original uploaded program: costs, seams, placed geometry, and exported DXF entities matched. All 13 sample PDF pages were rendered and visually inspected. The desktop GUI was not exercised interactively; its export handler uses the tested write_outputs function.
-
-Run `python make_sample_report.py` to regenerate the demonstration PDF. The sample is a report/export check, not validation of nesting optimality or production cutting accuracy.

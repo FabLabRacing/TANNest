@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-DXF Sheet Nester
-================
+TANNest
+=======
 Nests DXF parts onto stock sheets (rectangular / bounding-box nesting) and
 automatically splits parts that are too long for any sheet into weldable
 segments, keeping seams away from internal features and notches.
@@ -33,7 +33,7 @@ Limits worth knowing:
     are flattened to the tolerance setting). Un-split parts and all internal
     features are written as their original lines / arcs / circles.
 
-
+OUTPUT IS A DRAFT: check every sheet in SheetCam before cutting.
 """
 
 import itertools
@@ -80,7 +80,9 @@ class Settings:
     seam_step: float = 0.0625    # seams land on multiples of this (0 = exact)
     flatten_tol: float = 0.005   # chord tolerance when arcs become polylines
     join_tol: float = 0.005      # endpoint gap allowed when chaining lines/arcs
-    effort: int = 400            # number of pack attempts
+    effort: int = 400            # base search effort; scaled up automatically for big jobs
+    max_seconds: float = 60.0    # stop searching after this long, whatever the effort
+    corner_clear: float = 2.0    # min distance seam -> inside (concave) corner of the outline
     avoid_notches: bool = True   # keep seams out of notches / concave areas
     # ---- cost model (layouts are scored in dollars)
     thickness: float = 0.25          # plate thickness, inches
@@ -338,12 +340,40 @@ def merge_intervals(iv):
     return out
 
 
-def keepouts(prep, st, use_notches=True):
+def concave_corners(poly, min_turn=0.02):
+    """X positions of inside (reflex) corners of a polygon's outline."""
+    pts = list(orient(poly).exterior.coords)[:-1]
+    n = len(pts)
+    out = []
+    for i in range(n):
+        (x0, y0), (x1, y1), (x2, y2) = pts[i - 1], pts[i], pts[(i + 1) % n]
+        ax, ay, bx, by = x1 - x0, y1 - y0, x2 - x1, y2 - y1
+        la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+        if la < 1e-9 or lb < 1e-9:
+            continue
+        if (ax * by - ay * bx) / (la * lb) < -min_turn:     # right turn on a CCW ring
+            out.append(x1)
+    return out
+
+
+NOTCH_MAX_FRACTION = 0.25   # concave areas longer than this share of the part are reliefs, not notches
+
+
+def keepouts(prep, st, level=2):
+    """Seam keep-out intervals along the part's long axis.
+
+    level 2: internal features + inside corners + notches
+    level 1: internal features + inside corners
+    level 0: internal features only (last resort)
+    """
     iv = []
     for _, _, poly in prep.inner:
         a, _, b, _ = poly.bounds
         iv.append((a - st.seam_clear, b + st.seam_clear))
-    if use_notches and st.avoid_notches:
+    if level >= 1 and st.corner_clear > 0:
+        for x in concave_corners(prep.outer):
+            iv.append((x - st.corner_clear, x + st.corner_clear))
+    if level >= 2 and st.avoid_notches:
         # grow the outline a hair first so float noise along straight edges
         # doesn't turn into long sliver "notches"
         grow = max(1e-3, 2 * st.join_tol)
@@ -352,7 +382,10 @@ def keepouts(prep, st, use_notches=True):
         for g in geoms:
             if not g.is_empty and g.area > 1e-3:
                 a, _, b, _ = g.bounds
-                iv.append((a - grow - st.seam_clear, b + grow + st.seam_clear))
+                # a long shallow relief (e.g. a narrowed middle section) is part of the
+                # shape, not a notch: only its corners are kept clear (level 1)
+                if (b - a) <= NOTCH_MAX_FRACTION * prep.W:
+                    iv.append((a - grow - st.seam_clear, b + grow + st.seam_clear))
     return merge_intervals(iv)
 
 
@@ -422,13 +455,19 @@ def seam_candidates(prep, sheets, st, max_cands=24):
     m_max = max(maxlens)
 
     note = None
-    iv = keepouts(prep, st, True)
-    cands = _gen_cands(L, maxlens, m_max, iv, st)
-    if not cands and st.avoid_notches:
-        iv = keepouts(prep, st, False)
+    fallback_notes = {
+        1: f"{prep.part.name}: no seam layout avoids the notches; seams may cross one "
+           f"(inside corners still kept {st.corner_clear:g} clear)",
+        0: f"{prep.part.name}: WARNING no seam layout keeps clear of inside corners; "
+           f"check seams against the outline corners",
+    }
+    cands = []
+    for level in (2, 1, 0):
+        iv = keepouts(prep, st, level)
         cands = _gen_cands(L, maxlens, m_max, iv, st)
         if cands:
-            note = f"{prep.part.name}: no seam layout avoids the notches, seams may cross one"
+            note = fallback_notes.get(level) if level < 2 else None
+            break
     if not cands:
         return None, (f"{prep.part.name}: could not place seams clear of internal "
                       f"features (try a smaller seam clearance or bigger sheets)")
@@ -888,7 +927,12 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
     heurs = ["BL", "BSSF", "BAF"]
     cache = {}
     state = {"best": None, "key": None, "attempts": 0}
-    budget = max(200, st.effort * 4)
+    # bigger jobs (more parts, more seam layouts) need more attempts to converge
+    n_cands = sum(len(c) for c in cand_lists)
+    scale = max(1.0, len(preps) / 4.0, n_cands / 40.0)
+    budget = int(max(200, st.effort * 4 * scale))
+    t_stop = t0 + st.max_seconds if st.max_seconds > 0 else float("inf")
+    state["timed_out"] = False
 
     def n_seams_of(combo):
         return sum(len(cand_lists[k][idx]) * preps[k].part.qty for k, idx in enumerate(combo))
@@ -900,6 +944,9 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
         best_k = None
         for t in range(tries):
             if cancel is not None and cancel.is_set():
+                break
+            if time.time() > t_stop:
+                state["timed_out"] = True
                 break
             if not randomize and t < len(orders) * len(heurs):
                 seq = sorted(items, key=orders[t % len(orders)])
@@ -941,7 +988,7 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
             changed = False
             for k in range(len(cand_lists)):
                 for idx in range(len(cand_lists[k])):
-                    if state["attempts"] > budget * 0.6:
+                    if state["attempts"] > budget * 0.6 or time.time() > t_stop:
                         break
                     c2 = cur[:k] + (idx,) + cur[k + 1:]
                     if c2 not in cache:
@@ -959,6 +1006,9 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
         run(c, max(12, left // max(1, len(top))), randomize=True)
 
     best, attempts = state["best"], state["attempts"]
+    if state["timed_out"]:
+        notes.append(f"search stopped at the {st.max_seconds:g} s time limit after {attempts} "
+                     f"layouts (planned {budget}); raise the limit for a more thorough search")
     if best is None:
         raise ValueError("No layout found: some part does not fit any enabled sheet.")
 
@@ -1061,7 +1111,7 @@ def sheet_filename(i, b):
 def write_outputs(res, st, folder):
     # Fail before writing DXFs if PDF support is unavailable.
     try:
-        import reportlab
+        import reportlab  # noqa: F401
     except ImportError as ex:
         raise RuntimeError("PDF export requires ReportLab. Install with: pip install reportlab") from ex
     os.makedirs(folder, exist_ok=True)
@@ -1142,7 +1192,7 @@ def report_text(res, st):
     L = [f"{APP_NAME} report  ({time.strftime('%m/%d/%Y %I:%M %p')})",
          "DRAFT - verify every sheet in CAM before cutting.", "",
          f"Edge border {st.border}  |  part spacing {st.spacing}  |  seam clearance {st.seam_clear}"
-         f"  |  min segment {st.min_seg}  (drawing units: {u})",
+         f"  |  corner clearance {st.corner_clear}  |  min segment {st.min_seg}  (drawing units: {u})",
          f"Plate {st.thickness} in @ {st.density} lb/in^3  |  material {_usd(st.material_cost_lb)}/lb"
          f"  |  weld {_usd(st.weld_cost_ft)}/ft  |  remnant credit {st.remnant_credit:g}%"
          f" (strips >= {st.min_remnant:g} in)", ""]
@@ -1183,17 +1233,21 @@ def report_text(res, st):
             L.append(f"  {ns:>5} {nb:>6} {ev['area']:>12,.0f} {_usd(ev['material']):>11} "
                      f"{_usd(ev['weld']):>10} {_usd(ev['credit']):>9} {_usd(ev['total']):>11}{mark}")
         if len(res.tradeoff) >= 2:
-            (n1, _, e1), (n2, _, e2) = res.tradeoff[0], res.tradeoff[1]
-            d_area = e1["area"] - e2["area"]
-            d_ft = (e2["weld_ft"] - e1["weld_ft"])
-            if d_ft > EPS and d_area > EPS:
-                lb = d_area * cm.lb_per_area
-                L.append(f"  Break-even: going from {n1} to {n2} seams saves {lb:,.1f} lb of plate for "
-                         f"{d_ft:,.2f} ft more weld -> worth it only if a foot of seam costs less "
-                         f"than {lb / d_ft:,.2f} lb of plate")
+            L.append("")
+            L.append("  Break-even for each step (extra seams pay off only below this weld cost):")
+            for (n1, _, e1), (n2, _, e2) in zip(res.tradeoff, res.tradeoff[1:]):
+                d_ft = e2["weld_ft"] - e1["weld_ft"]
+                d_lb = e1["sheet_lb"] - e2["sheet_lb"]
+                d_usd = (e1["material"] - e1["credit"]) - (e2["material"] - e2["credit"])
+                if d_ft <= EPS or d_lb <= EPS:
+                    continue
+                line = (f"    {n1:>3} -> {n2:<3} seams: saves {d_lb:8,.1f} lb of plate for "
+                        f"{d_ft:6.2f} ft more weld = {d_lb / d_ft:6.2f} lb/ft")
                 if st.material_cost_lb > 0:
-                    L.append(f"              (at {_usd(st.material_cost_lb)}/lb that is "
-                             f"{_usd(lb / d_ft * st.material_cost_lb)}/ft of weld)")
+                    line += f"  ->  pays off below {_usd(d_usd / d_ft)}/ft"
+                    if st.remnant_credit > 0:
+                        line += " (net of remnant credit)"
+                L.append(line)
     L.append("")
     for i, b in enumerate(res.bins, 1):
         W, Ls = b.sheet
@@ -1336,7 +1390,7 @@ def write_pdf_report(res, st, filename, report_note=None):
             cv.restoreState()
 
     story.append(p('TANNest | Nest report', 'ReportTitle'))
-    note(time.strftime('Generated %Y-%m-%d at %H:%M') + ' | DRAFT - review before cutting')
+    note(time.strftime('Generated %m/%d/%Y at %I:%M %p') + ' | DRAFT - review before cutting')
     if report_note:
         note(report_note)
     table(['Estimated total', 'Stock sheets', 'Finished seams', 'Net plate utilization'],
@@ -1378,16 +1432,18 @@ def write_pdf_report(res, st, filename, report_note=None):
 
     story.append(PageBreak())
     heading('Settings and layout comparison')
-    note(f'{res.attempts} layouts tried in {res.seconds:.1f} seconds. Heuristic search; global optimum not proven.')
+    note(f'{res.attempts} layouts tried in {res.seconds:.1f} seconds (effort is scaled up automatically '
+         'for larger jobs). Heuristic search; global optimum not proven.')
     table(['Setting', 'Value', 'Setting', 'Value'], [
         ['Thickness', f'{st.thickness:g} in', 'Density', f'{st.density:g} lb/in^3'],
         ['Material price', _usd(st.material_cost_lb) + '/lb', 'Finished weld price', _usd(st.weld_cost_ft) + '/ft'],
         ['Remnant credit', f'{st.remnant_credit:g}%', 'Minimum remnant', f'{st.min_remnant:g} in'],
         ['Edge border', f'{st.border:g} {unit}', 'Part spacing', f'{st.spacing:g} {unit}'],
         ['Seam clearance', f'{st.seam_clear:g} {unit}', 'Min segment', f'{st.min_seg:g} {unit}'],
-        ['Seam rounding', f'{st.seam_step:g} {unit}', 'Avoid notches', str(st.avoid_notches)],
-        ['Arc tolerance', f'{st.flatten_tol:g} {unit}', 'Join tolerance', f'{st.join_tol:g} {unit}'],
-        ['Search effort', st.effort, 'Scoring', 'Cost' if cm.priced else 'Sheet area'],
+        ['Corner clearance', f'{st.corner_clear:g} {unit}', 'Avoid notches', str(st.avoid_notches)],
+        ['Seam rounding', f'{st.seam_step:g} {unit}', 'Arc tolerance', f'{st.flatten_tol:g} {unit}'],
+        ['Join tolerance', f'{st.join_tol:g} {unit}', 'Scoring', 'Cost' if cm.priced else 'Sheet area'],
+        ['Search effort (base)', st.effort, 'Time limit', f'{st.max_seconds:g} s'],
     ], [.24, .26, .24, .26])
     note('Material grade is not stored in the result; thickness and density above are the actual costing inputs.')
     heading('Alternatives retained by the optimizer')
@@ -1400,15 +1456,24 @@ def write_pdf_report(res, st, filename, report_note=None):
               [.16, .08, .15, .16, .14, .14, .17], right=(1, 2, 3, 4, 5, 6))
     else:
         note('No alternative layouts were retained.')
-    # Preserve the legacy plate-only break-even explanation, explicitly scoped.
+    # Break-even for each step of the trade-off list (same figures as the text report)
     if res.tradeoff and len(res.tradeoff) >= 2:
-        (n1, _, e1), (n2, _, e2) = res.tradeoff[:2]
-        da, df = e1['area'] - e2['area'], e2['weld_ft'] - e1['weld_ft']
-        if da > EPS and df > EPS:
-            lb = da * cm.lb_per_area
-            note(f'Plate-only break-even, {n1} to {n2} seams: saves {lb:,.1f} lb for {df:,.2f} ft '
-                 f'more weld ({lb/df:,.2f} lb per weld foot; {_usd(lb/df*st.material_cost_lb)}/ft). '
-                 'This legacy comparison excludes changes in remnant credit; use the totals above for the full comparison.')
+        rows = []
+        for (n1, _, e1), (n2, _, e2) in zip(res.tradeoff, res.tradeoff[1:]):
+            d_ft = e2['weld_ft'] - e1['weld_ft']
+            d_lb = e1['sheet_lb'] - e2['sheet_lb']
+            d_usd = (e1['material'] - e1['credit']) - (e2['material'] - e2['credit'])
+            if d_ft <= EPS or d_lb <= EPS:
+                continue
+            rows.append([f'{n1} to {n2}', f'{d_lb:,.1f}', f'{d_ft:,.2f}', f'{d_lb / d_ft:,.2f}',
+                         _usd(d_usd / d_ft) + '/ft' if st.material_cost_lb > 0 else 'n/a'])
+        if rows:
+            heading('Break-even for each step')
+            note('Extra seams in each step pay off only when finished weld costs less than the last column. '
+                 'Dollar figures are net of remnant credit. The optimizer chooses by comparing totals directly; '
+                 'steps need not fall in order because layouts change shape between seam counts.')
+            table(['Seams', 'Plate saved (lb)', 'Extra weld (ft)', 'lb plate per weld ft',
+                   'Pays off below'], rows, [.16, .20, .20, .22, .22], right=(1, 2, 3, 4))
 
     for i, b in enumerate(res.bins, 1):
         story.append(PageBreak())
@@ -1628,7 +1693,8 @@ def run_gui(test_hook=None):
             rows = [("border", "Edge border"), ("spacing", "Part spacing"),
                     ("seam_clear", "Seam clearance"), ("min_seg", "Min segment length"),
                     ("seam_step", "Seam rounding step"), ("flatten_tol", "Arc flatten tol."),
-                    ("join_tol", "Endpoint join tol."), ("effort", "Search effort")]
+                    ("join_tol", "Endpoint join tol."), ("corner_clear", "Corner clearance"),
+                    ("effort", "Search effort"), ("max_seconds", "Time limit (s)")]
             for i, (k, lbl) in enumerate(rows):
                 ttk.Label(gf, text=lbl).grid(row=i, column=0, sticky="w")
                 v = tk.StringVar(value=str(getattr(self.st, k)))
