@@ -235,7 +235,7 @@ Saving a SheetCam job template with these three layer operations makes every TAN
   - weld feet and $
   - total
 - **Trade-off table**: the best layout found at each seam count, priced at your settings, with the chosen one marked. Use it to see what fewer or more seams would have cost.
-- **Break-even for each step**: for every step in the trade-off table, the plate saved per foot of extra weld and the weld price below which those extra seams pay off. The app itself picks the layout by comparing totals directly; the steps are there so you can see how sensitive the choice is to your weld rate.
+- **Best when weld costs**: a column on the trade-off table giving the weld $/ft range over which each layout would be the cheapest (plate minus remnant credit plus weld). "Never best" means another layout always beats it. Totals in the table are at your entered weld rate; the ranges show how the choice would change at other rates, comparing only the layouts listed.
 - **Per sheet**:
   - size, weight and cost
   - remnant length past the last part

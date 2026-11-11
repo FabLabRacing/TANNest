@@ -1222,6 +1222,51 @@ def _usd(x):
     return f"${x:,.2f}"
 
 
+def best_weld_ranges(tradeoff):
+    """For each trade-off row, the weld $/ft range over which it is the cheapest layout.
+
+    Each layout's total is a straight line in the weld rate W:
+        total(W) = (plate $ - remnant credit) + weld_ft * W
+    Walking the lowest of those lines from W = 0 upward gives each layout's range.
+    Returns a list of (lo, hi) per row (hi = inf for "and above"), or None if never cheapest.
+    """
+    lines = [(ev["material"] - ev["credit"], ev["weld_ft"]) for _, _, ev in tradeoff]
+    out = [None] * len(lines)
+    if not lines:
+        return out
+    cur = min(range(len(lines)), key=lambda i: (round(lines[i][0], 6), lines[i][1]))
+    w = 0.0
+    while True:
+        c0, f0 = lines[cur]
+        nxt, w_next = None, None
+        for j, (c1, f1) in enumerate(lines):
+            if f1 < f0 - EPS:
+                wc = (c1 - c0) / (f0 - f1)
+                if wc > w + 1e-9 and (w_next is None or wc < w_next - 1e-9
+                                      or (abs(wc - w_next) <= 1e-9 and f1 < lines[nxt][1])):
+                    nxt, w_next = j, wc
+        if nxt is None:
+            out[cur] = (w, float("inf"))
+            return out
+        out[cur] = (w, w_next)
+        cur, w = nxt, w_next
+
+
+def weld_range_text(rng, priced):
+    if not priced:
+        return "n/a (no material price)"
+    if rng is None:
+        return "never best"
+    lo, hi = rng
+    if lo <= EPS and hi == float("inf"):
+        return "at any weld rate"
+    if lo <= EPS:
+        return f"below {_usd(hi)}/ft"
+    if hi == float("inf"):
+        return f"above {_usd(lo)}/ft"
+    return f"{_usd(lo)} to {_usd(hi)}/ft"
+
+
 def report_text(res, st):
     u = UNIT_NAMES.get(res.preps[0].part.units, "")
     cm, c = res.model, res.cost
@@ -1261,29 +1306,21 @@ def report_text(res, st):
 
     if res.tradeoff and len(res.tradeoff) > 1:
         L.append("")
+        priced = st.material_cost_lb > 0
+        ranges = best_weld_ranges(res.tradeoff)
         L.append("TRADE-OFF: best layout found at each seam count (fewer seams vs less plate)")
         L.append(f"  {'seams':>5} {'sheets':>6} {'plate sq in':>12} {'material':>11} {'weld':>10} "
-                 f"{'credit':>9} {'total':>11}")
-        for ns, nb, ev in res.tradeoff:
+                 f"{'credit':>9} {'total':>11}   best when weld costs")
+        for (ns, nb, ev), rng in zip(res.tradeoff, ranges):
             mark = "  <- chosen" if ns == res.n_seams and abs(ev["area"] - c["area"]) < EPS else ""
             L.append(f"  {ns:>5} {nb:>6} {ev['area']:>12,.0f} {_usd(ev['material']):>11} "
-                     f"{_usd(ev['weld']):>10} {_usd(ev['credit']):>9} {_usd(ev['total']):>11}{mark}")
-        if len(res.tradeoff) >= 2:
-            L.append("")
-            L.append("  Break-even for each step (extra seams pay off only below this weld cost):")
-            for (n1, _, e1), (n2, _, e2) in zip(res.tradeoff, res.tradeoff[1:]):
-                d_ft = e2["weld_ft"] - e1["weld_ft"]
-                d_lb = e1["sheet_lb"] - e2["sheet_lb"]
-                d_usd = (e1["material"] - e1["credit"]) - (e2["material"] - e2["credit"])
-                if d_ft <= EPS or d_lb <= EPS:
-                    continue
-                line = (f"    {n1:>3} -> {n2:<3} seams: saves {d_lb:8,.1f} lb of plate for "
-                        f"{d_ft:6.2f} ft more weld = {d_lb / d_ft:6.2f} lb/ft")
-                if st.material_cost_lb > 0:
-                    line += f"  ->  pays off below {_usd(d_usd / d_ft)}/ft"
-                    if st.remnant_credit > 0:
-                        line += " (net of remnant credit)"
-                L.append(line)
+                     f"{_usd(ev['weld']):>10} {_usd(ev['credit']):>9} {_usd(ev['total']):>11}   "
+                     f"{weld_range_text(rng, priced)}{mark}")
+        L.append(f"  Totals above are at your weld rate ({_usd(st.weld_cost_ft)}/ft). 'Best when' shows the "
+                 f"weld rates at which each layout")
+        L.append("  would be cheapest (plate minus remnant credit plus weld); 'never best' means another "
+                 "layout always beats it.")
+        L.append("  Ranges compare only the layouts listed; rerun at your real weld rate for a definitive answer.")
     L.append("")
     for i, b in enumerate(res.bins, 1):
         W, Ls = b.sheet
@@ -1485,32 +1522,21 @@ def write_pdf_report(res, st, filename, report_note=None):
     heading('Alternatives retained by the optimizer')
     note(f'Area is in {unit} squared (drawing units). This is the optimizer\'s filtered trade-off list, not every attempted layout.')
     if res.tradeoff:
-        table(['Seams / choice', 'Sheets', f'Area ({unit}^2)', 'Plate', 'Weld', 'Credit', 'Total'],
+        ranges = best_weld_ranges(res.tradeoff)
+        priced = st.material_cost_lb > 0
+        table(['Seams / choice', 'Sheets', f'Area ({unit}^2)', 'Plate', 'Weld', 'Credit', 'Total',
+               'Best when weld costs'],
               [[str(ns) + (' - chosen' if ns == res.n_seams and abs(ev['area']-c['area']) < EPS else ''),
                 nb, f"{ev['area']:,.0f}", _usd(ev['material']), _usd(ev['weld']),
-                _usd(ev['credit']), _usd(ev['total'])] for ns, nb, ev in res.tradeoff],
-              [.16, .08, .15, .16, .14, .14, .17], right=(1, 2, 3, 4, 5, 6))
+                _usd(ev['credit']), _usd(ev['total']), weld_range_text(rng, priced)]
+               for (ns, nb, ev), rng in zip(res.tradeoff, ranges)],
+              [.12, .08, .12, .13, .11, .11, .13, .20], right=(1, 2, 3, 4, 5, 6))
+        note(f'Totals are at your weld rate ({_usd(st.weld_cost_ft)}/ft). The last column shows the weld rates at '
+             'which each layout would be the cheapest (plate minus remnant credit plus weld); "never best" means '
+             'another layout always beats it. Ranges compare only the layouts listed; rerun at your real weld '
+             'rate for a definitive answer.')
     else:
         note('No alternative layouts were retained.')
-    # Break-even for each step of the trade-off list (same figures as the text report)
-    if res.tradeoff and len(res.tradeoff) >= 2:
-        rows = []
-        for (n1, _, e1), (n2, _, e2) in zip(res.tradeoff, res.tradeoff[1:]):
-            d_ft = e2['weld_ft'] - e1['weld_ft']
-            d_lb = e1['sheet_lb'] - e2['sheet_lb']
-            d_usd = (e1['material'] - e1['credit']) - (e2['material'] - e2['credit'])
-            if d_ft <= EPS or d_lb <= EPS:
-                continue
-            rows.append([f'{n1} to {n2}', f'{d_lb:,.1f}', f'{d_ft:,.2f}', f'{d_lb / d_ft:,.2f}',
-                         _usd(d_usd / d_ft) + '/ft' if st.material_cost_lb > 0 else 'n/a'])
-        if rows:
-            heading('Break-even for each step')
-            note('Extra seams in each step pay off only when finished weld costs less than the last column. '
-                 'Dollar figures are net of remnant credit. The optimizer chooses by comparing totals directly; '
-                 'steps need not fall in order because layouts change shape between seam counts.')
-            table(['Seams', 'Plate saved (lb)', 'Extra weld (ft)', 'lb plate per weld ft',
-                   'Pays off below'], rows, [.16, .20, .20, .22, .22], right=(1, 2, 3, 4))
-
     for i, b in enumerate(res.bins, 1):
         story.append(PageBreak())
         W, L = b.sheet
