@@ -87,7 +87,7 @@ If the window opens and shows the default sheet list, you're set. If you get `Mo
    - red lines are shared cut lines
    - green lines are holes
 6. **Check the Report / Log tab** for cost, seam locations, and the trade-off table.
-7. **Export DXFs + PDF...** and pick an output folder.
+7. **Export DXFs + PDFs...** and pick an output folder.
 
 ---
 
@@ -180,13 +180,14 @@ The layout with the lowest total wins. Ties go to less sheet area, then fewer se
 
 ## Output files
 
-**Export DXFs + PDF...** writes these files to the folder you choose:
+**Export DXFs + PDFs...** writes these files to the folder you choose:
 
 | File | Contents |
 |---|---|
 | `Sheet01_72x144_WallA-S1.dxf`, ... | One file per sheet. Sheet origin is at the lower left (0,0); length runs along X. |
-| `SeamMap_<part>.dxf` | Each split part in its original coordinates, with seam lines and labels on `SEAM_REF` |
+| `SeamMap_<part>.dxf` | Each split part in its original coordinates, with seam lines, seam labels, and each piece labeled with the sheet it comes from (all on `SEAM_REF`) |
 | `Nest_Report.txt` | The same report shown in the Report / Log tab |
+| `Assembly_Map.pdf` | For the shop floor: each split part as drawn in its DXF, with numbered seams and every piece tagged with its name and sheet number, plus a piece table (sheet, cut file, size) and a seam table (location, weld length, which pieces it joins). One page per copy of each split part, then a list of parts cut whole and their sheets. |
 | `Nest_Report.pdf` | Formatted report: summary, cost and material balance, stock to purchase, job inputs, settings, alternatives and break-even table, one page per sheet with a numbered layout drawing and remnant credits, and one page per part with its seams and where each piece was cut |
 
 **Layers in the sheet files:**

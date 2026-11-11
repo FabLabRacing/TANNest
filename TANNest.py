@@ -49,6 +49,7 @@ from dataclasses import dataclass
 
 import ezdxf
 from ezdxf import path as ezpath
+from ezdxf.enums import TextEntityAlignment
 from ezdxf.math import Matrix44, Vec3
 from shapely.geometry import Polygon, box
 from shapely.geometry.polygon import orient
@@ -654,13 +655,15 @@ class Item:
     h: float
     split: bool
     seg: tuple = None    # (a, b) normalized x-range when split
+    inst: int = 1        # which copy of the part (1..qty)
+    piece: int = 0       # segment number within the copy (0 = whole part)
 
 
-def build_items(prep, seams, instance_tag=""):
+def build_items(prep, seams, instance_tag="", inst=1):
     if not seams:
         return [Item(prep.part.name + instance_tag, prep, prep.outer,
                      [(lp, ly) for lp, ly, _ in prep.inner],
-                     0.0, 0.0, prep.W, prep.H, False)]
+                     0.0, 0.0, prep.W, prep.H, False, inst=inst)]
     items = []
     edges = [0.0] + list(seams) + [prep.W]
     n = 0
@@ -677,7 +680,7 @@ def build_items(prep, seams, instance_tag=""):
                 if ix0 >= a - EPS and ix1 <= b + EPS and g.buffer(EPS).contains(ip.representative_point()):
                     inner.append((lp, ly))
             items.append(Item(f"{prep.part.name}{instance_tag}-S{n}", prep, g, inner,
-                              x0, y0, x1 - x0, y1 - y0, True, (a, b)))
+                              x0, y0, x1 - x0, y1 - y0, True, (a, b), inst=inst, piece=n))
     return items
 
 
@@ -913,7 +916,7 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
             its = []
             for q in range(pr.part.qty):
                 tag = f"_{q + 1}" if pr.part.qty > 1 else ""
-                its.extend(build_items(pr, c, tag))
+                its.extend(build_items(pr, c, tag, q + 1))
             per.append(its)
         built.append(per)
 
@@ -1108,6 +1111,25 @@ def sheet_filename(i, b):
     return f"Sheet{i:02d}_{W:g}x{L:g}_{_safe(names)}.dxf"
 
 
+def piece_locations(res):
+    """{part name: [(item, sheet_no, x, y, rotated), ...]} for every placed piece."""
+    out = {}
+    for i, b in enumerate(res.bins, 1):
+        for it, x, y, r in b.placed:
+            out.setdefault(it.prep.part.name, []).append((it, i, x, y, r))
+    for v in out.values():
+        v.sort(key=lambda t: (t[0].inst, t[0].piece))
+    return out
+
+
+def _piece_label_point(it):
+    """A point inside the piece, in original drawing coordinates."""
+    inv = Matrix44(it.prep.M0)
+    inv.inverse()
+    rp = it.poly.representative_point()
+    return xform_pts(inv, [(rp.x, rp.y)])[0]
+
+
 def write_outputs(res, st, folder):
     # Fail before writing DXFs if PDF support is unavailable.
     try:
@@ -1140,6 +1162,7 @@ def write_outputs(res, st, folder):
         written.append(fn)
 
     # seam maps (original coordinates) for each split part
+    locs = piece_locations(res)
     for pr in res.preps:
         seams = res.seams.get(pr.part.name)
         if not seams:
@@ -1159,6 +1182,16 @@ def write_outputs(res, st, folder):
             msp.add_line(p0, p1, dxfattribs={"layer": "SEAM_REF"})
             msp.add_text(seam_label(pr, s), height=max(0.5, pr.H / 40),
                          dxfattribs={"layer": "SEAM_REF"}).set_placement(p1)
+        # label every piece with the sheet(s) it is cut from (one sheet per copy)
+        by_piece = {}
+        for it, sh, _, _, _ in locs.get(pr.part.name, []):
+            by_piece.setdefault(it.piece, (it, []))[1].append((it.inst, sh))
+        for piece, (it, sheets) in sorted(by_piece.items()):
+            txt = f"S{piece}: " + ", ".join(
+                f"Sheet {sh:02d}" + (f" (copy {inst})" if pr.part.qty > 1 else "")
+                for inst, sh in sorted(sheets))
+            msp.add_text(txt, height=max(0.5, pr.H / 30), dxfattribs={"layer": "SEAM_REF"}) \
+                .set_placement(_piece_label_point(it), align=TextEntityAlignment.MIDDLE_CENTER)
         fn = os.path.join(folder, f"SeamMap_{_safe(pr.part.name)}.dxf")
         doc.saveas(fn)
         written.append(fn)
@@ -1169,6 +1202,9 @@ def write_outputs(res, st, folder):
     written.append(fn)
     fn = os.path.join(folder, "Nest_Report.pdf")
     write_pdf_report(res, st, fn)
+    written.append(fn)
+    fn = os.path.join(folder, "Assembly_Map.pdf")
+    write_assembly_map(res, st, fn)
     written.append(fn)
     return written
 
@@ -1559,6 +1595,205 @@ def write_pdf_report(res, st, filename, report_note=None):
 
 
 
+def write_assembly_map(res, st, filename):
+    """Assembly map: each part as drawn in its DXF, with seam lines, every piece
+    labeled with its name and the sheet it is cut from, and a piece/seam table.
+    One page per copy of each split part, then a list of parts cut whole."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, PageBreak, Flowable, KeepTogether)
+
+    navy = colors.HexColor('#17344A')
+    teal = colors.HexColor('#087E8B')
+    pale = colors.HexColor('#EDF4F7')
+    gray = colors.HexColor('#536574')
+    red = colors.HexColor('#BA453B')
+    green = colors.HexColor('#248244')
+    page = landscape(letter)
+    width = page[0] - 72
+    unit = UNIT_NAMES.get(res.preps[0].part.units, 'unknown')
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle('T', fontName='Helvetica-Bold', fontSize=16, leading=20,
+                              textColor=navy, spaceAfter=2))
+    styles.add(ParagraphStyle('N', fontSize=8, leading=10.5, textColor=gray, spaceAfter=4))
+    styles.add(ParagraphStyle('C', fontSize=8, leading=10, textColor=navy))
+    styles.add(ParagraphStyle('CR', parent=styles['C'], alignment=TA_RIGHT))
+    styles.add(ParagraphStyle('H', parent=styles['C'], textColor=colors.white,
+                              fontName='Helvetica-Bold'))
+
+    def p(v, style='C'):
+        return Paragraph(escape(str(v)).replace('\n', '<br/>'), styles[style])
+
+    def table(headers, rows, widths, right=()):
+        data = [[p(h, 'H') for h in headers]] + \
+               [[p(v, 'CR' if i in right else 'C') for i, v in enumerate(r)] for r in rows]
+        t = Table(data, colWidths=[width * w for w in widths], repeatRows=1, hAlign='LEFT')
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), navy),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, pale]),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('LEFTPADDING', (0, 0), (-1, -1), 5), ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        return t
+
+    class Map(Flowable):
+        """Part outline as drawn, seams dashed, a tag in each piece."""
+        def __init__(self, pr, seams, tags, height):
+            super().__init__()
+            self.pr, self.seams, self.tags = pr, seams, tags
+            self.width, self.height = width, height
+
+        def draw(self):
+            cv, pr = self.canv, self.pr
+            x0, y0, x1, y1 = pr.part.outer.poly.bounds
+            sc = min((self.width - 40) / max(x1 - x0, EPS), (self.height - 40) / max(y1 - y0, EPS))
+            ox = (self.width - (x1 - x0) * sc) / 2
+            oy = (self.height - (y1 - y0) * sc) / 2
+
+            def P(x, y):
+                return ox + (x - x0) * sc, oy + (y - y0) * sc
+
+            def poly(pts, color, w):
+                cv.setStrokeColor(color)
+                cv.setLineWidth(w)
+                path = cv.beginPath()
+                path.moveTo(*P(*pts[0]))
+                for q in pts[1:]:
+                    path.lineTo(*P(*q))
+                path.close()
+                cv.drawPath(path)
+
+            cv.saveState()
+            poly(pr.part.outer.pts, navy, 1.0)
+            for lp, ly, _ in pr.inner:
+                poly(lp.pts, red if ly == 'COMMON_LINE' else green, 0.5)
+            inv = Matrix44(pr.M0)
+            inv.inverse()
+            cv.setStrokeColor(teal)
+            cv.setLineWidth(1.2)
+            cv.setDash(6, 3)
+            cv.setFont('Helvetica', 7)
+            cv.setFillColor(teal)
+            for k, s in enumerate(self.seams, 1):
+                a, b = xform_pts(inv, [(s, -0.04 * pr.H), (s, 1.04 * pr.H)])
+                (ax, ay), (bx, by) = P(*a), P(*b)
+                cv.line(ax, ay, bx, by)
+                if abs(ay - by) < abs(ax - bx):          # horizontal seam: label at right end
+                    tx, ty = (bx, by) if bx >= ax else (ax, ay)
+                    cv.drawString(tx + 4, ty - 2.5, f'Seam {k}')
+                else:                                     # vertical seam: label above top end
+                    tx, ty = (bx, by) if by >= ay else (ax, ay)
+                    cv.drawCentredString(tx, ty + 3, f'Seam {k}')
+            cv.setDash()
+            for (x, y), big, small, (bx0, by0, bx1, by1) in self.tags:
+                px, py = P(x, y)
+                cv.setFont('Helvetica-Bold', 11)
+                wbig = cv.stringWidth(big, 'Helvetica-Bold', 11)
+                wsmall = cv.stringWidth(small, 'Helvetica', 8)
+                bw, bh = max(wbig, wsmall) + 10, 28
+                # narrow piece: turn the tag sideways so it stays inside the piece
+                pw = abs(P(bx1, by1)[0] - P(bx0, by0)[0])
+                ph = abs(P(bx1, by1)[1] - P(bx0, by0)[1])
+                cv.saveState()
+                if pw < bw + 4 and ph > pw:
+                    cv.translate(px, py)
+                    cv.rotate(90)
+                    px, py = 0, 0
+                cv.setFillColor(colors.white)
+                cv.setStrokeColor(teal)
+                cv.setLineWidth(0.8)
+                cv.roundRect(px - bw / 2, py - bh / 2, bw, bh, 4, stroke=1, fill=1)
+                cv.setFillColor(navy)
+                cv.drawCentredString(px, py + 1.5, big)
+                cv.setFont('Helvetica', 8)
+                cv.setFillColor(gray)
+                cv.drawCentredString(px, py - 9, small)
+                cv.restoreState()
+            cv.restoreState()
+
+    locs = piece_locations(res)
+    story = []
+    whole = []
+    first = True
+    for pr in res.preps:
+        name = pr.part.name
+        seams = res.seams.get(name, [])
+        pieces = locs.get(name, [])
+        if not seams:
+            for it, sh, x, y, r in pieces:
+                whole.append([name + (f'  (copy {it.inst})' if pr.part.qty > 1 else ''),
+                              f'Sheet {sh:02d}', f'{it.w:.3f} x {it.h:.3f}',
+                              f'{st.border + x:.3f} / {st.border + y:.3f}', '90 deg' if r else '0 deg'])
+            continue
+        for inst in range(1, pr.part.qty + 1):
+            mine = [t for t in pieces if t[0].inst == inst]
+            if not first:
+                story.append(PageBreak())
+            first = False
+            title = name + (f'  |  copy {inst} of {pr.part.qty}' if pr.part.qty > 1 else '')
+            story.append(p(title, 'T'))
+            story.append(p(f'Source: {os.path.basename(pr.part.file)}  |  shown as drawn in the DXF '
+                           f'({unit})  |  {len(mine)} pieces, {len(seams)} seams  |  '
+                           'DRAFT - preview only, not to scale for fit-up', 'N'))
+            inv0 = Matrix44(pr.M0)
+            inv0.inverse()
+
+            def orig_bounds(it):
+                xs, ys = zip(*xform_pts(inv0, list(it.poly.exterior.coords)))
+                return min(xs), min(ys), max(xs), max(ys)
+            tags = [(_piece_label_point(it), f'S{it.piece}', f'Sheet {sh:02d}', orig_bounds(it))
+                    for it, sh, _, _, _ in mine]
+            story.append(Map(pr, seams, tags, 300))
+            story.append(p('Navy: outline  |  red: shared-cutline part (cut with its piece)  |  '
+                           'green: hole  |  dashed teal: seam', 'N'))
+            rows = [[f'S{it.piece}', it.name, f'Sheet {sh:02d}', sheet_filename(sh, res.bins[sh - 1]),
+                     f'{it.w:.3f} x {it.h:.3f}', '90 deg' if r else '0 deg']
+                    for it, sh, x, y, r in mine]
+            t1 = table(['Piece', 'Name', 'Sheet', 'Cut file', f'Size ({unit})', 'On sheet'],
+                       rows, [.06, .22, .08, .42, .13, .09])
+            sl = res.seam_len.get(name, [])
+            t2 = table(['Seam', 'Location (original drawing)', f'Weld length ({unit})', 'Joins'],
+                       [[k, seam_label(pr, s), f'{sl[k - 1]:.3f}' if k - 1 < len(sl) else '',
+                         f'S{k} + S{k + 1}'] for k, s in enumerate(seams, 1)],
+                       [.08, .40, .20, .32], right=(2,))
+            story.append(KeepTogether([t1, Spacer(1, 6), t2]))
+
+    if whole:
+        if story:
+            story.append(PageBreak())
+        story.append(p('Parts cut whole (no seams)', 'T'))
+        story.append(p('These parts are not split; each comes off one sheet complete.', 'N'))
+        story.append(table(['Part', 'Sheet', f'Size ({unit})', f'X / Y on sheet ({unit})', 'On sheet'],
+                           whole, [.40, .12, .18, .18, .12]))
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(gray)
+        canvas.setFont('Helvetica', 8)
+        canvas.drawString(36, 20, f'{APP_NAME} | Assembly map | generated '
+                          f'{time.strftime("%m/%d/%Y %I:%M %p")} | DRAFT - verify against the cut files')
+        canvas.drawRightString(page[0] - 36, 20, f'Page {doc.page}')
+        canvas.restoreState()
+
+    import tempfile
+    fd, temp = tempfile.mkstemp(suffix='.pdf', dir=os.path.dirname(os.path.abspath(filename)))
+    os.close(fd)
+    try:
+        doc = SimpleDocTemplate(temp, pagesize=page, leftMargin=36, rightMargin=36,
+                                topMargin=30, bottomMargin=36,
+                                title='TANNest Assembly Map', author='TANNest')
+        doc.build(story or [p('No parts.', 'N')], onFirstPage=footer, onLaterPages=footer)
+        os.replace(temp, filename)
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
+
+
 # ============================================================================
 #  GUI
 # ============================================================================
@@ -1748,7 +1983,7 @@ def run_gui(test_hook=None):
             ttk.Button(br, text="Remove", command=self._del_part).pack(side="left", padx=2)
             self.b_run = ttk.Button(br, text="Optimize", command=self._run)
             self.b_run.pack(side="right")
-            self.b_export = ttk.Button(br, text="Export DXFs + PDF...", command=self._export, state="disabled")
+            self.b_export = ttk.Button(br, text="Export DXFs + PDFs...", command=self._export, state="disabled")
             self.b_export.pack(side="right", padx=4)
 
             pr = ttk.Frame(right)
