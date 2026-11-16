@@ -11,16 +11,17 @@ Layouts are scored in dollars: plate cost, minus credit for usable remnants, plu
 ## Contents
 
 1. [Installation](#installation)
-2. [Quick start](#quick-start)
-3. [How TANNest reads a DXF](#how-tannest-reads-a-dxf)
-4. [Part options](#part-options)
-5. [Settings reference](#settings-reference)
-6. [Cost settings](#cost-settings)
-7. [Output files](#output-files)
-8. [Setting up SheetCam](#setting-up-sheetcam)
-9. [Reading the report](#reading-the-report)
-10. [Limitations](#limitations)
-11. [Troubleshooting](#troubleshooting)
+2. [Help inside the app](#help-inside-the-app)
+3. [Quick start](#quick-start)
+4. [How TANNest reads a DXF](#how-tannest-reads-a-dxf)
+5. [Part options](#part-options)
+6. [Settings reference](#settings-reference)
+7. [Cost settings](#cost-settings)
+8. [Output files](#output-files)
+9. [Setting up SheetCam](#setting-up-sheetcam)
+10. [Reading the report](#reading-the-report)
+11. [Limitations](#limitations)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -70,6 +71,13 @@ If the window opens and shows the default sheet list, you're set. If you get `Mo
 | `ezdxf`, `shapely` or `reportlab` | Rerun `pip install ezdxf shapely reportlab` |
 | `tkinter` (Windows) | Rerun the Python installer, choose Modify, and enable tcl/tk |
 | `tkinter` (Linux) | `sudo apt install python3-tk` |
+
+---
+
+## Help inside the app
+
+- **Help menu**: Quick start, Settings & Cost fields (also **F1**), Reading the results, and About (version, library versions and where the settings file lives).
+- **Tooltips**: hover over any Settings or Cost field for a one-line explanation.
 
 ---
 

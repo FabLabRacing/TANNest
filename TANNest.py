@@ -56,6 +56,7 @@ from shapely.geometry.polygon import orient
 
 EPS = 1e-6
 APP_NAME = "TANNest"
+APP_VERSION = "2026.11.16"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".tannest.json")
 
 DEFAULT_SHEETS = [(48, 96), (60, 96), (72, 96),
@@ -1821,11 +1822,226 @@ def write_assembly_map(res, st, filename):
 
 
 # ============================================================================
+#  Help text (Help menu and field tooltips)
+# ============================================================================
+# (key, label, one-line tooltip, full explanation)
+HELP_SETTINGS = [
+    ("border", "Edge border",
+     "Minimum distance from any part to the sheet edge.",
+     "Minimum distance from any part to the edge of the sheet. Covers mill edge, sheet "
+     "squareness and clamping. Typical values are 0.25 to 0.5 in. Larger is safer but "
+     "uses more plate on every sheet."),
+    ("spacing", "Part spacing",
+     "Minimum gap between parts on the same sheet.",
+     "Minimum gap between parts on the same sheet. It must be wider than the kerf, because "
+     "parts are cut with kerf compensation and the kerf comes out of this gap. Thin material "
+     "or heat-sensitive parts may need more."),
+    ("seam_clear", "Seam clearance",
+     "Minimum distance from a seam to any internal feature.",
+     "Minimum distance from a seam to any internal feature: holes, openings and shared-cutline "
+     "parts. Larger keeps welds further from features but limits where seams can go, which can "
+     "force extra seams or narrow pieces."),
+    ("min_seg", "Min segment length",
+     "Shortest piece a split is allowed to produce.",
+     "Shortest piece a split is allowed to produce. Raise it to avoid narrow strips that are hard "
+     "to handle, fit and weld. Set it too high and some parts cannot be split at all; the error "
+     "message names the part."),
+    ("seam_step", "Seam rounding step",
+     "Seams land on multiples of this (0.0625 = 1/16 in).",
+     "Seams are placed on multiples of this value, so 0.0625 puts every seam on a 1/16 in mark. "
+     "Use 0 for exact positions. Rounding makes seam dimensions easier to read and check."),
+    ("flatten_tol", "Arc flatten tol.",
+     "How closely arcs are approximated when they must become polylines.",
+     "How closely arcs are approximated when they have to become straight-line polylines: split "
+     "segment outlines and the previews. Smaller is smoother but makes larger files. Un-split "
+     "parts and internal features always keep their true arcs. Rarely needs changing."),
+    ("join_tol", "Endpoint join tol.",
+     "How close line ends must be to count as connected when reading a DXF.",
+     "How close two line or arc ends must be to count as connected when a DXF is read. If the "
+     "log reports open contours, a small increase (0.01 to 0.02) may fix it. Too large can join "
+     "geometry that should stay separate; fixing the drawing is better."),
+    ("corner_clear", "Corner clearance",
+     "Minimum distance from a seam to an inside corner of the outline.",
+     "Minimum distance from a seam to any inside (concave) corner of the part outline, such as "
+     "the shoulder of a notch or a step. Set it from your weld practice; this is an engineering "
+     "decision, not a software one. Checked separately from Seam clearance."),
+    ("effort", "Search effort",
+     "Base number of layouts to try; scaled up automatically for big jobs.",
+     "Base number of layout attempts. It is multiplied up automatically by the number of parts "
+     "and seam options, so large jobs get a more thorough search. Raise it if results change "
+     "noticeably between runs; it costs run time."),
+    ("max_seconds", "Time limit (s)",
+     "The search stops at this limit, whatever the effort.",
+     "The search stops at this limit whatever the effort setting, and the report says so if it "
+     "happened. 60 s suits most jobs. For very large jobs try 90 to 180 s; if a longer run gives "
+     "the same result, the shorter limit was enough."),
+    ("avoid_notches", "Keep seams out of notches",
+     "Seams avoid notches; inside corners are always protected.",
+     "On: seams stay out of notches, meaning concave cut-outs shorter than 25% of the part "
+     "length. Longer concave areas (a narrowed middle section, long side reliefs) are treated as "
+     "part of the shape and only their corners are protected. If no layout avoids a notch, "
+     "seams may cross it but corners stay protected. Off: only features and corners are "
+     "avoided."),
+]
+
+HELP_COST = [
+    ("material", "Material",
+     "Fills in the density for a common material; Custom keeps your own.",
+     "Picks the density for a common material: steel 0.2836, 304 stainless 0.289, 6061 "
+     "aluminum 0.0975 lb/in^3. Choose Custom to keep a density you typed yourself."),
+    ("thickness", "Thickness (in)",
+     "Plate thickness in inches. Check it every run.",
+     "Plate thickness, always in inches even if the DXF is in mm. It sets every weight and "
+     "plate cost, and so the balance between plate and weld cost that decides how many seams "
+     "are worth it. Check it every run: a value carried over from the last job silently skews "
+     "the results."),
+    ("density", "Density (lb/in^3)",
+     "Material density; filled in by Material or typed in.",
+     "Material density in pounds per cubic inch. Filled in by the Material list or typed in "
+     "for anything else."),
+    ("material_cost_lb", "Material $/lb",
+     "What you pay for plate. 0 = layouts scored by sheet area only.",
+     "What you pay for plate, per pound. Every sheet used is charged in full. With 0, layouts "
+     "are scored by total sheet area instead of dollars."),
+    ("weld_cost_ft", "Weld $/ft",
+     "Full cost of one foot of finished seam.",
+     "Full cost of one foot of finished seam: fit-up, prep, all passes, both sides if welded "
+     "both sides, and grinding. This is what decides how many seams the app will accept to save "
+     "plate. 0 makes seams free, so the app will add seams freely."),
+    ("remnant_credit", "Remnant credit %",
+     "Share of a usable remnant's value credited back. 0 if drops are scrapped.",
+     "Share of a usable remnant's material value credited back to the layout. Use 0 if drops "
+     "go to scrap and close to 100 only if they are reliably reused at full value. It nudges "
+     "the search toward leaving one large usable piece instead of scattered scrap."),
+    ("min_remnant", "Min remnant (in)",
+     "Narrowest strip that counts as a usable remnant.",
+     "Narrowest strip that counts as a usable remnant, in inches. The app looks at the "
+     "full-width strip past the last part and the strip above the parts on each sheet. Set it "
+     "to the narrowest piece you would actually rack."),
+]
+
+HELP_QUICK = [
+    ("1. Sheets", "Check the stock list on the left. Double-click a sheet (or select it and "
+     "press On/Off) to include or exclude it; type a width and length and press Add for a new "
+     "size; Defaults restores the standard nine."),
+    ("2. Cost", "Set material, thickness, $/lb and weld $/ft. Check thickness every run."),
+    ("3. Parts", "Add DXF... and pick part files. The Report / Log tab lists what was found in "
+     "each file. Double-click a part to set quantity, outside profile only, rotation and "
+     "splitting. Use Duplicate to run the same DXF twice with different options."),
+    ("4. Optimize", "Press Optimize. The status bar shows the total and the Preview tab shows "
+     "every sheet: black = outside cut, red = shared cut line, green = hole."),
+    ("5. Review", "Read the Report / Log tab: cost summary, trade-off table and seam "
+     "positions."),
+    ("6. Export", "Export DXFs + PDFs... writes one DXF per sheet, seam map DXFs, the text and "
+     "PDF reports and the Assembly Map. All output is a draft: check every sheet in CAM before "
+     "cutting."),
+]
+
+HELP_RESULTS = [
+    ("Status bar", "Total cost of the chosen layout with plate, weld and remnant credit, plus "
+     "sheet and seam counts."),
+    ("Trade-off table", "The best layout found at each seam count, priced at your settings. "
+     "The chosen layout is marked."),
+    ("Best when weld costs", "The weld $/ft range over which each layout would be the "
+     "cheapest. Find your real weld rate in this column to see which layout fits it. 'Never "
+     "best' means another layout always beats it. The ranges compare only the layouts listed; "
+     "rerun at your real weld rate for a definitive answer."),
+    ("Layers in sheet DXFs", "OUTSIDE = outline (outside offset). COMMON_LINE = shared cut "
+     "line between an opening and its drop part (on-line, no offset). HOLES = holes (inside "
+     "offset). SHEET_REF_NOCUT = sheet outline for reference; do not assign an operation."),
+    ("Assembly Map", "Each split part as drawn, with numbered seams and every piece tagged "
+     "with the sheet it comes from. Use it to kit and fit up parts that were nested across "
+     "several sheets."),
+    ("Seam positions", "Given in the original drawing coordinates, so they match the part's "
+     "own DXF and the SeamMap files."),
+]
+
+
+# ============================================================================
 #  GUI
 # ============================================================================
 def run_gui(test_hook=None):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+
+    class Tooltip:
+        """Small hover tip for a widget."""
+        def __init__(self, widget, text, delay=600):
+            self.w, self.text, self.delay = widget, text, delay
+            self.tip, self.job = None, None
+            widget.bind("<Enter>", self._schedule, add="+")
+            widget.bind("<Leave>", self._hide, add="+")
+            widget.bind("<ButtonPress>", self._hide, add="+")
+
+        def _schedule(self, _e=None):
+            self._hide()
+            self.job = self.w.after(self.delay, self._show)
+
+        def _show(self):
+            x = self.w.winfo_rootx() + 12
+            y = self.w.winfo_rooty() + self.w.winfo_height() + 4
+            self.tip = tk.Toplevel(self.w)
+            self.tip.wm_overrideredirect(True)
+            self.tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(self.tip, text=self.text, justify="left", wraplength=320,
+                     background="#FFFFE6", relief="solid", borderwidth=1,
+                     padx=6, pady=3).pack()
+
+        def _hide(self, _e=None):
+            if self.job:
+                self.w.after_cancel(self.job)
+                self.job = None
+            if self.tip:
+                self.tip.destroy()
+                self.tip = None
+
+    class HelpWindow(tk.Toplevel):
+        TABS = ("Quick start", "Settings & Cost fields", "Reading the results")
+
+        def __init__(self, master):
+            super().__init__(master)
+            self.title(f"{APP_NAME} Help")
+            self.geometry("760x620")
+            self.minsize(520, 400)
+            self.nb = ttk.Notebook(self)
+            self.nb.pack(fill="both", expand=True, padx=6, pady=6)
+            self._page(self.TABS[0], [("Getting a layout", HELP_QUICK)])
+            self._page(self.TABS[1], [
+                ("Settings", [(lbl, full) for _, lbl, _, full in HELP_SETTINGS]),
+                ("Cost (scores layouts in $)", [(lbl, full) for _, lbl, _, full in HELP_COST]),
+            ], intro="All lengths are in drawing units (normally inches) unless the field says "
+                     "otherwise. Hover over any field in the main window for a one-line tip.")
+            self._page(self.TABS[2], [("What the output means", HELP_RESULTS)])
+            ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 6))
+            self.bind("<Escape>", lambda e: self.destroy())
+
+        def _page(self, title, sections, intro=None):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text=title)
+            t = tk.Text(f, wrap="word", padx=12, pady=10, relief="flat",
+                        font=("TkDefaultFont", 10), spacing1=1, spacing3=3)
+            sb = ttk.Scrollbar(f, orient="vertical", command=t.yview)
+            t.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            t.pack(side="left", fill="both", expand=True)
+            t.tag_configure("h", font=("TkDefaultFont", 12, "bold"), spacing1=8, spacing3=4)
+            t.tag_configure("k", font=("TkDefaultFont", 10, "bold"))
+            t.tag_configure("i", foreground="#536574")
+            t.tag_configure("b", spacing3=9)
+            if intro:
+                t.insert("end", intro + "\n", "i")
+            for head, items in sections:
+                t.insert("end", head + "\n", "h")
+                for k, v in items:
+                    t.insert("end", k + ":  ", ("k", "b"))
+                    t.insert("end", v + "\n", "b")
+            t.configure(state="disabled")
+
+        def show(self, tab):
+            self.nb.select(self.TABS.index(tab))
+            self.deiconify()
+            self.lift()
+            self.focus_set()
 
     class PartDialog(tk.Toplevel):
         def __init__(self, master, part):
@@ -1886,8 +2102,51 @@ def run_gui(test_hook=None):
             self.st = Settings()
             self._load_config()
             self._build()
+            self._build_menu()
             self._refresh_sheets()
             self.protocol("WM_DELETE_WINDOW", self._close)
+
+        # ---------- help ----------
+        def _build_menu(self):
+            mb = tk.Menu(self)
+            fm = tk.Menu(mb, tearoff=0)
+            fm.add_command(label="Add DXF...", command=self._add_dxf)
+            fm.add_command(label="Export DXFs + PDFs...", command=self._export)
+            fm.add_separator()
+            fm.add_command(label="Exit", command=self._close)
+            mb.add_cascade(label="File", menu=fm)
+            hm = tk.Menu(mb, tearoff=0)
+            hm.add_command(label="Quick start", command=lambda: self._help("Quick start"))
+            hm.add_command(label="Settings & Cost fields", accelerator="F1",
+                           command=lambda: self._help("Settings & Cost fields"))
+            hm.add_command(label="Reading the results", command=lambda: self._help("Reading the results"))
+            hm.add_separator()
+            hm.add_command(label=f"About {APP_NAME}", command=self._about)
+            mb.add_cascade(label="Help", menu=hm)
+            self.config(menu=mb)
+            self.bind("<F1>", lambda e: self._help("Settings & Cost fields"))
+
+        def _help(self, tab):
+            w = getattr(self, "_help_win", None)
+            if w is None or not w.winfo_exists():
+                self._help_win = w = HelpWindow(self)
+            w.show(tab)
+
+        def _about(self):
+            import platform
+            vers = []
+            for mod in ("ezdxf", "shapely", "reportlab"):
+                try:
+                    vers.append(f"{mod} {__import__(mod).__version__}")
+                except Exception:
+                    vers.append(f"{mod} not installed")
+            messagebox.showinfo(f"About {APP_NAME}", (
+                f"{APP_NAME}  version {APP_VERSION}\n"
+                "Sheet nesting and part splitting for the plasma table.\n"
+                "Internal tool for TANN Corporation.\n\n"
+                f"Python {platform.python_version()}  |  " + "  |  ".join(vers) + "\n"
+                f"Settings file: {CONFIG_PATH}\n\n"
+                "All output is a draft: verify every sheet in CAM before cutting."))
 
         # ---------- config ----------
         def _load_config(self):
@@ -1956,29 +2215,36 @@ def run_gui(test_hook=None):
                     ("seam_step", "Seam rounding step"), ("flatten_tol", "Arc flatten tol."),
                     ("join_tol", "Endpoint join tol."), ("corner_clear", "Corner clearance"),
                     ("effort", "Search effort"), ("max_seconds", "Time limit (s)")]
+            tips = {k: tip for k, _, tip, _ in HELP_SETTINGS + HELP_COST}
+            self._tips = []
+
+            def tipped(widget, key):
+                if key in tips:
+                    self._tips.append(Tooltip(widget, tips[key]))
+                return widget
             for i, (k, lbl) in enumerate(rows):
-                ttk.Label(gf, text=lbl).grid(row=i, column=0, sticky="w")
+                tipped(ttk.Label(gf, text=lbl), k).grid(row=i, column=0, sticky="w")
                 v = tk.StringVar(value=str(getattr(self.st, k)))
-                ttk.Entry(gf, textvariable=v, width=9).grid(row=i, column=1, sticky="e", pady=1)
+                tipped(ttk.Entry(gf, textvariable=v, width=9), k).grid(row=i, column=1, sticky="e", pady=1)
                 self.vars[k] = v
             self.v_notch = tk.BooleanVar(value=self.st.avoid_notches)
-            ttk.Checkbutton(gf, text="Keep seams out of notches", variable=self.v_notch).grid(
-                row=len(rows), column=0, columnspan=2, sticky="w")
+            tipped(ttk.Checkbutton(gf, text="Keep seams out of notches", variable=self.v_notch),
+                   "avoid_notches").grid(row=len(rows), column=0, columnspan=2, sticky="w")
 
             cf_ = ttk.LabelFrame(left, text="Cost (scores layouts in $)", padding=4)
             cf_.pack(fill="x", pady=(6, 0))
-            ttk.Label(cf_, text="Material").grid(row=0, column=0, sticky="w")
+            tipped(ttk.Label(cf_, text="Material"), "material").grid(row=0, column=0, sticky="w")
             self.v_mat = tk.StringVar()
             mats = [f"{n} ({d})" for n, d in MATERIALS] + ["Custom"]
             cb = ttk.Combobox(cf_, textvariable=self.v_mat, values=mats, width=17, state="readonly")
-            cb.grid(row=0, column=1, sticky="e", pady=1)
+            tipped(cb, "material").grid(row=0, column=1, sticky="e", pady=1)
             crow = [("thickness", "Thickness (in)"), ("density", "Density (lb/in^3)"),
                     ("material_cost_lb", "Material $/lb"), ("weld_cost_ft", "Weld $/ft"),
                     ("remnant_credit", "Remnant credit %"), ("min_remnant", "Min remnant (in)")]
             for i, (k, lbl) in enumerate(crow, 1):
-                ttk.Label(cf_, text=lbl).grid(row=i, column=0, sticky="w")
+                tipped(ttk.Label(cf_, text=lbl), k).grid(row=i, column=0, sticky="w")
                 v = tk.StringVar(value=str(getattr(self.st, k)))
-                ttk.Entry(cf_, textvariable=v, width=9).grid(row=i, column=1, sticky="e", pady=1)
+                tipped(ttk.Entry(cf_, textvariable=v, width=9), k).grid(row=i, column=1, sticky="e", pady=1)
                 self.vars[k] = v
 
             def _mat_pick(_e=None):
