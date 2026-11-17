@@ -56,7 +56,7 @@ from shapely.geometry.polygon import orient
 
 EPS = 1e-6
 APP_NAME = "TANNest"
-APP_VERSION = "2026.11.16"
+APP_VERSION = "2026.11.16c"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".tannest.json")
 
 DEFAULT_SHEETS = [(48, 96), (60, 96), (72, 96),
@@ -86,6 +86,10 @@ class Settings:
     max_seconds: float = 60.0    # stop searching after this long, whatever the effort
     corner_clear: float = 2.0    # min distance seam -> inside (concave) corner of the outline
     avoid_notches: bool = True   # keep seams out of notches / concave areas
+    # ---- two-direction splitting (only for parts with "allow both directions" ticked)
+    min_stagger: float = 6.0     # min offset between cross seams meeting a row seam from either side
+    opening_min: float = 12.0    # rectangular openings at least this big may have seams on their edges
+    edge_seams: bool = True      # allow row seams along the edges of large rectangular openings
     # ---- cost model (layouts are scored in dollars)
     thickness: float = 0.25          # plate thickness, inches
     density: float = 0.2836          # lb / cubic inch (steel)
@@ -119,7 +123,9 @@ class Part:
     profile_only: bool = False
     allow_rotate: bool = True
     allow_split: bool = True
+    allow_2d: bool = False       # opt-in: split in both directions when one direction can't fit
     doc: object = None           # keeps the source document alive
+    group: dict = None           # set on sub-parts made by a two-direction split
 
     @property
     def size(self):
@@ -344,6 +350,11 @@ def merge_intervals(iv):
 
 def concave_corners(poly, min_turn=0.02):
     """X positions of inside (reflex) corners of a polygon's outline."""
+    return [x for x, _ in concave_corner_pts(poly, min_turn)]
+
+
+def concave_corner_pts(poly, min_turn=0.02):
+    """(x, y) of inside (reflex) corners of a polygon's outline."""
     pts = list(orient(poly).exterior.coords)[:-1]
     n = len(pts)
     out = []
@@ -354,7 +365,7 @@ def concave_corners(poly, min_turn=0.02):
         if la < 1e-9 or lb < 1e-9:
             continue
         if (ax * by - ay * bx) / (la * lb) < -min_turn:     # right turn on a CCW ring
-            out.append(x1)
+            out.append((x1, y1))
     return out
 
 
@@ -888,9 +899,12 @@ class Result:
     tradeoff: list = None        # best layout found at each seam count
     net_area: float = 0.0
     model: object = None
+    groups: list = None          # two-direction split info (one dict per split parent)
 
 
-def optimize(parts, sheets, st, progress=None, cancel=None):
+def _optimize_core(parts, sheets, st, progress=None, cancel=None, combo_ok=None):
+    """The one-direction optimizer. combo_ok(preps, seam_lists) -> bool may veto
+    combinations of seam layouts (used for seam stagger on two-direction splits)."""
     t0 = time.time()
     sheets = [(min(a, b), max(a, b)) for a, b in sheets]
     notes = []
@@ -981,10 +995,23 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
             cache[combo] = best_k
         return best_k
 
+    def ok(c):
+        return combo_ok is None or combo_ok(preps, [cand_lists[k][i] for k, i in enumerate(c)])
+
     # 1) coordinate descent over seam layouts (one part at a time)
     quick = 6
     starts = [tuple(0 for _ in cand_lists),
               tuple(min(range(len(c)), key=lambda i: (len(c[i]), i)) for c in cand_lists)]
+    if combo_ok is not None:
+        starts = [c for c in starts if ok(c)]
+        tries = 0
+        while not starts and tries < 5000:
+            c = tuple(rng.randrange(len(cl)) for cl in cand_lists)
+            tries += 1
+            if ok(c):
+                starts.append(c)
+        if not starts:
+            raise ValueError("no combination of seam layouts meets the minimum seam stagger")
     for start in starts:
         cur = start
         run(cur, quick)
@@ -995,6 +1022,8 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
                     if state["attempts"] > budget * 0.6 or time.time() > t_stop:
                         break
                     c2 = cur[:k] + (idx,) + cur[k + 1:]
+                    if not ok(c2):
+                        continue
                     if c2 not in cache:
                         run(c2, quick)
                     if c2 in cache and (cur not in cache or cache[c2] < cache[cur]):
@@ -1037,6 +1066,444 @@ def optimize(parts, sheets, st, progress=None, cancel=None):
             best_area = ev["area"]
     return Result(bins, preps, seams, notes, area, part_area, n_seams, attempts, time.time() - t0,
                   cost=cost, seam_len=slens, tradeoff=pareto, net_area=net, model=cm)
+
+
+# ============================================================================
+#  Two-direction splitting (opt-in per part)
+# ============================================================================
+# A part too wide for every sheet in BOTH directions is first cut across its short
+# side into rows ("row seams"). Each row (or each piece of a row, when an opening
+# splits it) then becomes an ordinary sub-part and goes through the normal
+# one-direction splitter and packer above, unchanged. Row seams may run exactly
+# along the top/bottom edges of large rectangular openings: the opening is then
+# formed by the gap between pieces instead of being cut out of plate.
+
+def needs_2d(part, sheets, st):
+    """True when the part's short side fits no enabled sheet (one direction can't work)."""
+    x0, y0, x1, y1 = part.outer.poly.bounds
+    w, h = x1 - x0, y1 - y0
+    short = min(w, h) if part.allow_rotate else h
+    for W_s, L_s in sheets:
+        uW, uL = W_s - 2 * st.border, L_s - 2 * st.border
+        if short <= uW + EPS or (part.allow_rotate and short <= uL + EPS):
+            return False
+    return True
+
+
+def _contact_len(poly, y, W, d=1e-4):
+    """Length along y where there is material on BOTH sides (= weld length of a row seam)."""
+    from shapely.geometry import LineString
+
+    def ivs(yy):
+        g = poly.intersection(LineString([(-1, yy), (W + 1, yy)]))
+        out = []
+        for seg in getattr(g, "geoms", [g]):
+            if seg.is_empty or seg.geom_type != "LineString":
+                continue
+            xs = [c[0] for c in seg.coords]
+            out.append((min(xs), max(xs)))
+        return merge_intervals(out)
+    a, b = ivs(y - d), ivs(y + d)
+    return sum(max(0.0, min(e1, e2) - max(s1, s2)) for s1, e1 in a for s2, e2 in b)
+
+
+def plan_rows(pp, sheets, st, cm, max_layouts=6):
+    """Candidate row-seam layouts (parent-normalized Y) for a two-direction split."""
+    from shapely.ops import unary_union
+    W, H = pp.W, pp.H
+    caps = {round(W_s - 2 * st.border, 6) for W_s, L_s in sheets}
+    caps = {c for c in caps if c >= st.min_seg}
+    if not caps:
+        return []
+    m = max(caps)
+    feats = pp.inner
+
+    def feat_iv(skip=(), cross=()):
+        """Row-seam keep-outs. Features in `skip` are ignored entirely (seam on their
+        edge); features in `cross` may be crossed, only their top/bottom are kept clear."""
+        iv = []
+        for i, (_, _, poly) in enumerate(feats):
+            if i in skip:
+                continue
+            _, a, _, b = poly.bounds
+            if i in cross:
+                iv.append((a - st.seam_clear, a + st.seam_clear))
+                iv.append((b - st.seam_clear, b + st.seam_clear))
+            else:
+                iv.append((a - st.seam_clear, b + st.seam_clear))
+        if st.corner_clear > 0:
+            for _, y in concave_corner_pts(pp.outer):
+                iv.append((y - st.corner_clear, y + st.corner_clear))
+        return merge_intervals(iv)
+    iv_all = feat_iv()
+
+    openings = []                      # rectangular: seams may run on their edges
+    crossable = []                     # any shape: seams may cross them
+    if st.edge_seams:
+        for i, (_, ly, poly) in enumerate(feats):
+            if ly != "HOLES":
+                continue
+            x0, y0, x1, y1 = poly.bounds
+            if (x1 - x0) >= st.opening_min and (y1 - y0) >= st.opening_min:
+                crossable.append((i, x0, y0, x1, y1))
+                if poly.area >= 0.995 * (x1 - x0) * (y1 - y0):
+                    openings.append((i, x0, y0, x1, y1))
+    cross_idx = {o[0] for o in crossable}
+
+    layouts = set(tuple(c) for c in _gen_cands(H, caps, m, iv_all, st))
+    if crossable:      # row seams through large openings (the opening becomes a gap)
+        layouts |= set(tuple(c) for c in _gen_cands(H, caps, m, feat_iv(cross=cross_idx), st))
+    edges = sorted({round(v, 6) for o in openings for v in (o[2], o[4]) if EPS < v < H - EPS})[:6]
+    for r in range(1, len(edges) + 1):
+        for F in itertools.combinations(edges, r):
+            good = True
+            for f in F:
+                skip = {o[0] for o in openings if abs(o[2] - f) < 1e-6 or abs(o[4] - f) < 1e-6}
+                if _inside(f, feat_iv(skip)):
+                    good = False
+                    break
+            if not good:
+                continue
+            pts = [0.0] + list(F) + [H]
+            options = [[]]
+            for a, b in zip(pts, pts[1:]):
+                g = b - a
+                if g < st.min_seg - EPS:
+                    good = False
+                    break
+                if g <= m + EPS:
+                    continue
+                sub = [(s0 - a, e0 - a) for s0, e0 in iv_all if e0 > a and s0 < b]
+                gc = _gen_cands(g, caps, m, sub, st)
+                if not gc:
+                    good = False
+                    break
+                gc = sorted(gc, key=lambda c: (len(c), c))[:2]
+                options = [o + [a + x for x in c] for o in options for c in gc]
+            if good:
+                for o in options:
+                    layouts.add(tuple(sorted(round(v, 6) for v in list(F) + o)))
+
+    out = []
+    for rows in layouts:
+        rows = list(rows)
+        opened = [o for o in crossable
+                  if any(abs(o[2] - y) < 1e-6 or abs(o[4] - y) < 1e-6 or o[2] < y < o[4] for y in rows)]
+        outer2 = pp.outer
+        if opened:
+            outer2 = outer2.difference(unary_union([feats[o[0]][2] for o in opened])).buffer(0)
+        welds = [_contact_len(outer2, y, W) for y in rows]
+        if cm.priced:
+            est = (round(outer2.area * cm.usd_per_area + sum(welds) * cm.usd_per_len, 2), len(rows))
+        else:
+            est = (round(outer2.area, 3), sum(welds))
+        out.append(dict(rows=rows, opened=opened, outer2=outer2, welds=welds, est=est))
+    out.sort(key=lambda d: (d["est"], d["rows"]))
+    keep = out[:max_layouts]
+    for flag in (True, False):                 # always try the best of each kind
+        for d in [d for d in out if bool(d["opened"]) == flag][:1]:
+            if d not in keep:
+                keep.append(d)
+    return keep
+
+
+def build_subparts(parent, pp, lay):
+    """Sub-parts (original drawing coordinates) for one row layout."""
+    inv = Matrix44(pp.M0)
+    inv.inverse()
+    rows = lay["rows"]
+    bands = [0.0] + rows + [pp.H]
+    opened_idx = {o[0] for o in lay["opened"]}
+    info = dict(parent=parent, pp=pp, rows=rows, opened=lay["opened"], welds=lay["welds"],
+                qty=parent.qty, subs={})
+    subs = []
+    from shapely.ops import unary_union
+    # opened openings, stretched a hair past their seamed edges so they become clean
+    # notches/gaps in the row pieces instead of holes that touch the piece boundary
+    def opening_shape(o):
+        i, ox0, oy0, ox1, oy1 = o
+        poly = pp.inner[i][2]
+        if poly.area >= 0.995 * (ox1 - ox0) * (oy1 - oy0):
+            return box(ox0, oy0 - 1e-7, ox1, oy1 + 1e-7)
+        return poly
+    cut = unary_union([opening_shape(o) for o in lay["opened"]]) if lay["opened"] else None
+    for k, (a, b) in enumerate(zip(bands, bands[1:]), 1):
+        clip = pp.outer.intersection(box(-1, a, pp.W + 1, b))
+        if cut is not None:
+            clip = clip.difference(cut)
+        comps = [g for g in getattr(clip, "geoms", [clip]) if g.geom_type == "Polygon" and g.area > 1e-6]
+        comps.sort(key=lambda g: g.bounds[0])
+        for j, g in enumerate(comps):
+            # snap away the 1e-7 stretch and drop duplicate points
+            ring = []
+            for x, y in g.exterior.coords:
+                q = (round(x, 6), round(y, 6))
+                if not ring or q != ring[-1]:
+                    ring.append(q)
+            g = Polygon(ring).buffer(0)
+            if g.geom_type != "Polygon" or list(g.interiors):
+                raise ValueError(f"{parent.name}: could not form clean row pieces for this layout")
+            g = orient(g)
+            tag = f"R{k}" + (chr(97 + j) if len(comps) > 1 else "")
+            pts = xform_pts(inv, list(g.exterior.coords))
+            inner = [(lp, ly) for i, (lp, ly, ip) in enumerate(pp.inner)
+                     if i not in opened_idx and g.buffer(1e-6).contains(ip.representative_point())]
+            sp = Part(name=f"{parent.name}-{tag}", file=parent.file,
+                      outer=Loop(ents=[], pts=pts, poly=Polygon(pts)), inner=inner,
+                      units=parent.units, qty=parent.qty, profile_only=False,
+                      allow_rotate=parent.allow_rotate, allow_split=parent.allow_split,
+                      doc=parent.doc)
+            sp.group = dict(parent=parent.name, tag=tag, band=k, y=(a, b))
+            subs.append(sp)
+            info["subs"][sp.name] = sp.group
+    return subs, info
+
+
+def _crossing_xs(poly, y, W):
+    from shapely.geometry import LineString
+    g = poly.boundary.intersection(LineString([(-1, y), (W + 1, y)]))
+    pts = []
+    for q in getattr(g, "geoms", [g]):
+        if q.is_empty:
+            continue
+        pts += [c[0] for c in q.coords]
+    return pts
+
+
+def make_stagger_checker(groups, st):
+    """Veto seam combinations where cross seams meet a row seam closer than min_stagger
+    to each other, or to an opening corner on the other side."""
+    if st.min_stagger <= 0:
+        return None
+    lookup = {name: (g, info) for g in groups for name, info in g["subs"].items()}
+
+    def ok(preps, seam_lists):
+        per = {}
+        for pr, seams in zip(preps, seam_lists):
+            hit = lookup.get(pr.part.name)
+            if not hit or not seams:
+                continue
+            g, info = hit
+            inv = Matrix44(pr.M0)
+            inv.inverse()
+            for s in seams:
+                (x0, _), (x1, _) = xform_pts(g["pp"].M0, xform_pts(inv, [(s, 0), (s, pr.H)]))
+                if abs(x0 - x1) < 1e-6:            # cross seam (perpendicular to the rows)
+                    per.setdefault((id(g), info["band"]), []).append(x0)
+        for g in groups:
+            for k, y in enumerate(g["rows"], 1):  # row seam between band k and k+1
+                low = per.get((id(g), k), [])
+                up = per.get((id(g), k + 1), [])
+                low_c, up_c = [], []
+                for oi, ox0, oy0, ox1, oy1 in g["opened"]:
+                    if abs(oy1 - y) < 1e-6:
+                        low_c += [ox0, ox1]
+                    elif abs(oy0 - y) < 1e-6:
+                        up_c += [ox0, ox1]
+                    elif oy0 < y < oy1:       # seam crosses the opening: weld ends at its edges
+                        xs = _crossing_xs(g["pp"].inner[oi][2], y, g["pp"].W)
+                        low_c += xs
+                        up_c += xs
+                for xa in low:
+                    if any(abs(xa - xb) < st.min_stagger - EPS for xb in up + up_c):
+                        return False
+                for xb in up:
+                    if any(abs(xa - xb) < st.min_stagger - EPS for xa in low_c):
+                        return False
+        return True
+    return ok
+
+
+def group_geometry(res, g):
+    """Lines and labels for one two-direction split, in original drawing coordinates.
+    Returns dict(rows=[(p0, p1, label, weld)], cross=[(p0, p1, label, weld, sub name)],
+                 opened=[pts], features=[(layer, pts)])."""
+    pp = g["pp"]
+    inv = Matrix44(pp.M0)
+    inv.inverse()
+    out = dict(rows=[], cross=[], opened=[], features=[])
+    for y, w in zip(g["rows"], g["welds"]):
+        p0, p1 = xform_pts(inv, [(-0.03 * pp.W, y), (1.03 * pp.W, y)])
+        out["rows"].append((p0, p1, row_label(pp, y), w))
+    by_name = {pr.part.name: pr for pr in res.preps}
+    for name in g["subs"]:
+        pr = by_name.get(name)
+        if pr is None:
+            continue
+        si = Matrix44(pr.M0)
+        si.inverse()
+        for s_, w in zip(res.seams.get(name, []), (res.seam_len or {}).get(name, [])):
+            p0, p1 = xform_pts(si, [(s_, 0), (s_, pr.H)])
+            out["cross"].append((p0, p1, seam_label(pr, s_), w, name))
+    opened_idx = {o[0] for o in g["opened"]}
+    for i, (lp, ly, _) in enumerate(pp.inner):
+        if i in opened_idx:
+            out["opened"].append(lp.pts)
+        else:
+            out["features"].append((ly, lp.pts))
+    return out
+
+
+def row_label(pp, y):
+    inv = Matrix44(pp.M0)
+    inv.inverse()
+    (x0, y0), (x1, y1) = xform_pts(inv, [(0, y), (pp.W, y)])
+    return f"SEAM Y={y0:.4f}" if abs(y0 - y1) < 1e-6 else f"SEAM X={x0:.4f}"
+
+
+def optimize(parts, sheets, st, progress=None, cancel=None):
+    """Nest the job.
+
+    Parts without "allow both directions" (the default) go straight to the
+    one-direction optimizer, unchanged. Parts with it ticked are also tried as
+    two-direction splits (row seams across the short side), and a split is kept
+    only when it lowers the total cost. A part too big for one direction must
+    be split both ways.
+
+    Time strategy: a quick screening pass compares row layouts one part at a time
+    (about a third of the time limit), then the rest of the time goes to the best
+    one or two combinations.
+    """
+    sheets_n = [(min(a, b), max(a, b)) for a, b in sheets]
+    active = [p for p in parts if p.qty >= 1]
+    cand = [p for p in active if p.allow_2d and p.allow_split]
+    if not cand:
+        return _optimize_core(parts, sheets, st, progress, cancel)
+
+    t0 = time.time()
+    cm = CostModel(st, active[0].units)
+    per = []                                     # (part, prep, options); option None = one direction
+    for p in cand:
+        pp = prepare(p)
+        must = needs_2d(p, sheets_n, st)
+        lays = plan_rows(pp, sheets_n, st, cm, max_layouts=6 if must else 5)
+        if must and not lays:
+            raise ValueError(f"{p.name}: no row seam layout fits the enabled sheets "
+                             f"(check seam clearance, corner clearance and min segment)")
+        opts = ([] if must else [None]) + lays
+        per.append((p, pp, opts))
+    if all(o == [None] for _, _, o in per):
+        return _optimize_core(parts, sheets, st, progress, cancel)
+    normal = [p for p in parts if not any(p is q for q, _, _ in per)]
+
+    limit = st.max_seconds if st.max_seconds > 0 else None
+    n_quick = 1 + 2 * sum(len(o) - 1 for _, _, o in per)
+    quick_effort = max(60, st.effort // 4)
+    quick_secs = max(2.0, 0.35 * limit / n_quick) if limit else None
+    cache, notes, state = {}, [], {"attempts": 0, "phase": 0.0}
+
+    def evaluate(combo, secs, effort, frac0, frac1):
+        if combo in cache and cache[combo][1] == "full":
+            return cache[combo][0]
+        subs, groups, whole = [], [], []
+        for (p, pp, opts), oi in zip(per, combo):
+            lay = opts[oi]
+            if lay is None:
+                whole.append(p)
+            else:
+                try:
+                    sp, g = build_subparts(p, pp, lay)
+                except ValueError as ex:
+                    notes.append(str(ex))
+                    return None
+                subs += sp
+                groups.append(g)
+        st2 = Settings(**st.__dict__)
+        st2.effort = effort
+        st2.max_seconds = secs if secs else 0.0
+        prog = None
+        if progress:
+            prog = (lambda f, k: progress(frac0 + (frac1 - frac0) * f, k))
+        try:
+            r = _optimize_core(normal + whole + subs, sheets, st2, prog, cancel,
+                               combo_ok=make_stagger_checker(groups, st) if groups else None)
+        except ValueError as ex:
+            notes.append(str(ex))
+            return None
+        state["attempts"] += r.attempts
+        row_len = sum(sum(g["welds"]) * g["qty"] for g in groups)
+        row_ft = row_len * cm.f / 12.0
+        row_n = sum(len(g["rows"]) * g["qty"] for g in groups)
+        key = (round(r.cost["total"] + row_ft * st.weld_cost_ft, 2), round(r.cost["area"], 4),
+               r.n_seams + row_n, len(r.bins))
+        hit = (key, "quick" if effort < st.effort else "full", r, groups, row_ft, row_n)
+        if combo not in cache or key < cache[combo][0]:
+            cache[combo] = hit
+        return key
+
+    def over(frac):
+        return limit is not None and time.time() - t0 > frac * limit
+
+    # 1) screening: one part at a time, starting from "everything one direction"
+    cur = tuple(0 for _ in per)
+    evaluate(cur, quick_secs, quick_effort, 0.0, 0.05)
+    for _round in range(2):
+        improved = False
+        for i, (_, _, opts) in enumerate(per):
+            for j in range(len(opts)):
+                if over(0.40) or (cancel is not None and cancel.is_set()):
+                    break
+                c = cur[:i] + (j,) + cur[i + 1:]
+                if c in cache:
+                    continue
+                k = evaluate(c, quick_secs, quick_effort, 0.0, 0.35)
+                if k is not None and (cur not in cache or k < cache[cur][0]):
+                    cur, improved = c, True
+        if not improved:
+            break
+    if not cache:
+        raise ValueError("No layout found: " + "; ".join(notes[-3:]))
+
+    # 2) the rest of the time on the best one or two combinations, at full effort
+    top = sorted(cache, key=lambda c: cache[c][0])[:2]
+    for n, c in enumerate(top):
+        if cancel is not None and cancel.is_set():
+            break
+        secs = None
+        if limit:
+            secs = max(2.0, (limit - (time.time() - t0)) / (len(top) - n))
+        evaluate(c, secs, st.effort, 0.4 + 0.6 * n / len(top), 0.4 + 0.6 * (n + 1) / len(top))
+
+    best = min(cache.values(), key=lambda h: h[0])
+    _, _, r, groups, row_ft, row_n = best
+    row_usd = row_ft * st.weld_cost_ft
+    for ev in [r.cost] + [ev for _, _, ev in (r.tradeoff or [])]:
+        ev["weld"] += row_usd
+        ev["total"] += row_usd
+        ev["weld_ft"] += row_ft
+    r.tradeoff = [(ns + row_n, nb, ev) for ns, nb, ev in (r.tradeoff or [])]
+    r.n_seams += row_n
+    r.groups = groups
+    r.attempts = state["attempts"]
+    r.seconds = time.time() - t0
+    r.notes = [n for n in r.notes if not n.startswith("search stopped")]
+    if limit and r.seconds >= 0.97 * limit:
+        r.notes.insert(0, f"search used the full {limit:g} s time limit (comparing one- and two-direction "
+                          f"splits); a longer limit may find a better layout")
+    for g in groups:
+        rows = g["rows"]
+        edged = [o for o in g["opened"] if any(abs(o[2] - y) < 1e-6 or abs(o[4] - y) < 1e-6 for y in rows)]
+        crossed = [o for o in g["opened"] if o not in edged]
+        saved = sum(g["pp"].inner[o[0]][2].area for o in edged)
+        txt = f"{g['parent'].name}: split in two directions into {len(g['subs'])} sub-parts"
+        if edged:
+            txt += (f"; {len(edged)} opening(s) formed between pieces instead of cut "
+                    f"({saved:,.0f} sq less plate per copy)")
+        if crossed:
+            txt += f"; row seam passes through {len(crossed)} opening(s) (no weld across the opening)"
+        r.notes.append(txt)
+    kept = [p.name for (p, _, opts), oi in zip(per, cache_key_of(cache, best)) if opts[oi] is None
+            and not needs_2d(p, sheets_n, st)]
+    if kept:
+        r.notes.append("two-direction splits were tried but one direction was cheaper for: " + ", ".join(kept))
+    return r
+
+
+def cache_key_of(cache, hit):
+    for k, v in cache.items():
+        if v is hit:
+            return k
+    return ()
 
 
 # ============================================================================
@@ -1152,9 +1619,12 @@ def write_outputs(res, st, folder):
             if it.split:
                 pts = xform_pts(T, list(it.poly.exterior.coords)[:-1])
                 msp.add_lwpolyline(pts, close=True, dxfattribs={"layer": "OUTSIDE"})
-            else:
+            elif it.prep.part.outer.ents:
                 for e, rev in it.prep.part.outer.ents:
                     _add_transformed(msp, e, M, "OUTSIDE", rev, st.flatten_tol)
+            else:       # sub-part from a two-direction split: outline is a polyline
+                pts = xform_pts(M, it.prep.part.outer.pts[:-1])
+                msp.add_lwpolyline(pts, close=True, dxfattribs={"layer": "OUTSIDE"})
             for lp, layer in it.inner:
                 for e, rev in lp.ents:
                     _add_transformed(msp, e, M, layer, rev, st.flatten_tol)
@@ -1166,13 +1636,15 @@ def write_outputs(res, st, folder):
     locs = piece_locations(res)
     for pr in res.preps:
         seams = res.seams.get(pr.part.name)
-        if not seams:
+        if not seams or pr.part.group:
             continue
         doc = _new_doc(pr.part.units)
         msp = doc.modelspace()
         ident = Matrix44()
         for e, rev in pr.part.outer.ents:
             _add_transformed(msp, e, ident, "OUTSIDE", rev, st.flatten_tol)
+        if not pr.part.outer.ents:
+            msp.add_lwpolyline(pr.part.outer.pts[:-1], close=True, dxfattribs={"layer": "OUTSIDE"})
         for lp, layer, _ in pr.inner:
             for e, rev in lp.ents:
                 _add_transformed(msp, e, ident, layer, rev, st.flatten_tol)
@@ -1194,6 +1666,42 @@ def write_outputs(res, st, folder):
             msp.add_text(txt, height=max(0.5, pr.H / 30), dxfattribs={"layer": "SEAM_REF"}) \
                 .set_placement(_piece_label_point(it), align=TextEntityAlignment.MIDDLE_CENTER)
         fn = os.path.join(folder, f"SeamMap_{_safe(pr.part.name)}.dxf")
+        doc.saveas(fn)
+        written.append(fn)
+
+    # two-direction parents: one seam map with row seams, cross seams and piece labels
+    for g in (res.groups or []):
+        parent = g["parent"]
+        geo = group_geometry(res, g)
+        doc = _new_doc(parent.units)
+        msp = doc.modelspace()
+        ident = Matrix44()
+        for e, rev in parent.outer.ents:
+            _add_transformed(msp, e, ident, "OUTSIDE", rev, st.flatten_tol)
+        for layer, pts in geo["features"]:
+            msp.add_lwpolyline(pts[:-1] if pts[0] == pts[-1] else pts, close=True,
+                               dxfattribs={"layer": layer})
+        for pts in geo["opened"]:   # formed by assembly, not cut: reference only
+            msp.add_lwpolyline(pts[:-1] if pts[0] == pts[-1] else pts, close=True,
+                               dxfattribs={"layer": "SEAM_REF"})
+        hgt = max(0.5, g["pp"].H / 45)
+        for p0, p1, lbl, _ in geo["rows"]:
+            msp.add_line(p0, p1, dxfattribs={"layer": "SEAM_REF"})
+            msp.add_text(lbl, height=hgt, dxfattribs={"layer": "SEAM_REF"}).set_placement(p1)
+        for p0, p1, lbl, _, _ in geo["cross"]:
+            msp.add_line(p0, p1, dxfattribs={"layer": "SEAM_REF"})
+        for name in g["subs"]:
+            tag = g["subs"][name]["tag"]
+            by_piece = {}
+            for it, sh, _, _, _ in locs.get(name, []):
+                by_piece.setdefault(it.piece, (it, []))[1].append((it.inst, sh))
+            for piece, (it, sheets) in sorted(by_piece.items()):
+                txt = (f"{tag}-S{piece}" if piece else tag) + ": " + ", ".join(
+                    f"Sheet {sh:02d}" + (f" (copy {inst})" if parent.qty > 1 else "")
+                    for inst, sh in sorted(sheets))
+                msp.add_text(txt, height=hgt, dxfattribs={"layer": "SEAM_REF"}) \
+                    .set_placement(_piece_label_point(it), align=TextEntityAlignment.MIDDLE_CENTER)
+        fn = os.path.join(folder, f"SeamMap_{_safe(parent.name)}.dxf")
         doc.saveas(fn)
         written.append(fn)
 
@@ -1333,6 +1841,20 @@ def report_text(res, st):
         for it, x, y, r in b.placed:
             L.append(f"    {it.name:<28} {it.w:9.3f} x {it.h:8.3f}  at ({st.border + x:.3f}, "
                      f"{st.border + y:.3f}){'  rotated 90' if r else ''}")
+    for g in (res.groups or []):
+        geo = group_geometry(res, g)
+        L.append("")
+        L.append(f"Two-direction split: {g['parent'].name}" +
+                 (f"  (x{g['qty']} parts)" if g["qty"] > 1 else ""))
+        L.append("  Row seams (across the part):")
+        for _, _, lbl, w in geo["rows"]:
+            L.append(f"    {lbl}   weld length {w:.3f}")
+        if g["opened"]:
+            L.append(f"  {len(g['opened'])} opening(s) lie on a row seam: formed by the gap between "
+                     "pieces, with no weld across them")
+        L.append("  Pieces: " + ", ".join(g["subs"]))
+        L.append(f"  Min seam stagger {st.min_stagger:g} (cross seams meeting a row seam from "
+                 "either side, and opening corners)")
     if res.seams:
         L.append("")
         L.append("Seams (original drawing coordinates):")
@@ -1536,6 +2058,18 @@ def write_pdf_report(res, st, filename, report_note=None):
              'which each layout would be the cheapest (plate minus remnant credit plus weld); "never best" means '
              'another layout always beats it. Ranges compare only the layouts listed; rerun at your real weld '
              'rate for a definitive answer.')
+    for g in (res.groups or []):
+        geo = group_geometry(res, g)
+        heading(f"Two-direction split: {g['parent'].name}")
+        note("Split across its short side into rows, then each row split as usual. "
+             + (f"{len(g['opened'])} opening(s) are formed by the gap between pieces instead of being cut. "
+                if g['opened'] else '')
+             + f"Cross seams are kept at least {st.min_stagger:g} {unit} apart where they meet a row seam. "
+             "See the Assembly Map for where each piece is cut.")
+        table(['Seam', 'Location (original drawing)', f'Weld length ({unit})'],
+              [[f'Row {k}', lbl, f'{w:.3f}'] for k, (_, _, lbl, w) in enumerate(geo['rows'], 1)] +
+              [[f"{g['subs'][n]['tag']} cross", lbl, f'{w:.3f}'] for _, _, lbl, w, n in geo['cross']],
+              [.25, .45, .30], right=(2,))
     else:
         note('No alternative layouts were retained.')
     for i, b in enumerate(res.bins, 1):
@@ -1743,12 +2277,120 @@ def write_assembly_map(res, st, filename):
                 cv.restoreState()
             cv.restoreState()
 
+    class GroupMap(Flowable):
+        """Whole two-direction part as drawn: outline, features, openings formed by
+        assembly (dashed gray), row and cross seams, a tag in every piece."""
+        def __init__(self, outline, feats, opened, lines, tags, height):
+            super().__init__()
+            self.outline, self.feats, self.opened = outline, feats, opened
+            self.lines, self.tags = lines, tags
+            self.width, self.height = width, height
+
+        def draw(self):
+            cv = self.canv
+            xs = [p[0] for p in self.outline]
+            ys = [p[1] for p in self.outline]
+            x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+            sc = min((self.width - 70) / max(x1 - x0, EPS), (self.height - 40) / max(y1 - y0, EPS))
+            ox = (self.width - (x1 - x0) * sc) / 2
+            oy = (self.height - (y1 - y0) * sc) / 2
+
+            def P(x, y):
+                return ox + (x - x0) * sc, oy + (y - y0) * sc
+
+            def poly(pts, color, w, dash=None):
+                cv.setStrokeColor(color)
+                cv.setLineWidth(w)
+                cv.setDash(*dash) if dash else cv.setDash()
+                path = cv.beginPath()
+                path.moveTo(*P(*pts[0]))
+                for q in pts[1:]:
+                    path.lineTo(*P(*q))
+                path.close()
+                cv.drawPath(path)
+            cv.saveState()
+            for pts in self.opened:
+                poly(pts, gray, 0.8, (2, 2))
+            poly(self.outline, navy, 1.0)
+            for ly, pts in self.feats:
+                poly(pts, red if ly == 'COMMON_LINE' else green, 0.5)
+            cv.setDash(6, 3)
+            cv.setFont('Helvetica', 7)
+            for (a, b, lbl, color) in self.lines:
+                cv.setStrokeColor(color)
+                cv.setFillColor(color)
+                cv.setLineWidth(1.2)
+                (ax, ay), (bx, by) = P(*a), P(*b)
+                cv.line(ax, ay, bx, by)
+                if lbl:
+                    if abs(ay - by) < abs(ax - bx):
+                        tx, ty = (bx, by) if bx >= ax else (ax, ay)
+                        cv.drawString(tx + 4, ty - 2.5, lbl)
+                    else:
+                        tx, ty = (bx, by) if by >= ay else (ax, ay)
+                        cv.drawCentredString(tx, ty + 3, lbl)
+            cv.setDash()
+            for (x, y), big, small in self.tags:
+                px, py = P(x, y)
+                bw = max(cv.stringWidth(big, 'Helvetica-Bold', 9), cv.stringWidth(small, 'Helvetica', 7)) + 8
+                bh = 22
+                cv.setFillColor(colors.white)
+                cv.setStrokeColor(teal)
+                cv.setLineWidth(0.8)
+                cv.roundRect(px - bw / 2, py - bh / 2, bw, bh, 3, stroke=1, fill=1)
+                cv.setFillColor(navy)
+                cv.setFont('Helvetica-Bold', 9)
+                cv.drawCentredString(px, py + 1, big)
+                cv.setFont('Helvetica', 7)
+                cv.setFillColor(gray)
+                cv.drawCentredString(px, py - 7.5, small)
+            cv.restoreState()
+
     locs = piece_locations(res)
     story = []
     whole = []
     first = True
+    in_group = set()
+    for g in (res.groups or []):
+        parent = g["parent"]
+        geo = group_geometry(res, g)
+        in_group |= set(g["subs"])
+        for inst in range(1, parent.qty + 1):
+            if not first:
+                story.append(PageBreak())
+            first = False
+            story.append(p(parent.name + '  |  two-direction split' +
+                           (f'  |  copy {inst} of {parent.qty}' if parent.qty > 1 else ''), 'T'))
+            story.append(p(f'Source: {os.path.basename(parent.file)}  |  shown as drawn in the DXF ({unit})  |  '
+                           f'{len(geo["rows"])} row seams, {len(geo["cross"])} cross seams'
+                           + (f'  |  {len(g["opened"])} opening(s) formed between pieces (dashed gray), not cut'
+                              if g["opened"] else '') + '  |  DRAFT - preview only', 'N'))
+            lines = [(a, b, f'Row {k}', navy) for k, (a, b, _, _) in enumerate(geo["rows"], 1)]
+            lines += [(a, b, None, teal) for a, b, _, _, _ in geo["cross"]]
+            tags, rows = [], []
+            for name, info in g["subs"].items():
+                for it, sh, x, y, r in locs.get(name, []):
+                    if it.inst != inst:
+                        continue
+                    label = f'{info["tag"]}-S{it.piece}' if it.piece else info["tag"]
+                    tags.append((_piece_label_point(it), label, f'Sheet {sh:02d}'))
+                    rows.append([label, it.name, f'Sheet {sh:02d}', sheet_filename(sh, res.bins[sh - 1]),
+                                 f'{it.w:.3f} x {it.h:.3f}', '90 deg' if r else '0 deg'])
+            story.append(GroupMap(parent.outer.pts, geo["features"], geo["opened"], lines, tags, 300))
+            story.append(p('Navy dashed: row seams  |  teal dashed: cross seams  |  dashed gray: opening formed '
+                           'by the gap between pieces  |  red: shared-cutline part  |  green: hole', 'N'))
+            t1 = table(['Piece', 'Name', 'Sheet', 'Cut file', f'Size ({unit})', 'On sheet'],
+                       rows, [.07, .22, .08, .41, .13, .09])
+            srows = [[f'Row {k}', lbl, f'{w:.3f}'] for k, (_, _, lbl, w) in enumerate(geo["rows"], 1)]
+            srows += [[f'{g["subs"][n]["tag"]} cross', lbl, f'{w:.3f}'] for _, _, lbl, w, n in geo["cross"]]
+            t2 = table(['Seam', 'Location (original drawing)', f'Weld length ({unit})'], srows,
+                       [.18, .52, .30], right=(2,))
+            story.append(KeepTogether([t1, Spacer(1, 6), t2]))
+
     for pr in res.preps:
         name = pr.part.name
+        if name in in_group:
+            continue
         seams = res.seams.get(name, [])
         pieces = locs.get(name, [])
         if not seams:
@@ -1875,6 +2517,25 @@ HELP_SETTINGS = [
      "The search stops at this limit whatever the effort setting, and the report says so if it "
      "happened. 60 s suits most jobs. For very large jobs try 90 to 180 s; if a longer run gives "
      "the same result, the shorter limit was enough."),
+    ("min_stagger", "Min seam stagger",
+     "Two-direction splits: minimum offset between cross seams meeting a row seam.",
+     "Only used for parts split in both directions. Where cross seams from the rows on either "
+     "side meet a row seam, they must be at least this far apart, so the welds form staggered "
+     "T-joints instead of a four-way cross. Also applies between a cross seam and the corner of "
+     "an opening formed between pieces. Set it from your weld practice."),
+    ("opening_min", "Min opening, edge seams",
+     "Two-direction splits: smallest opening a row seam may run along or through.",
+     "Only used for parts split in both directions, with 'Seams along or through large "
+     "openings' on. Openings at least this big in both directions may have a row seam run "
+     "through them (any shape) or exactly along their top or bottom edge (rectangles). The "
+     "opening is then formed by the gap between pieces, and that part of the seam needs no "
+     "weld. Smaller openings keep the normal seam clearance."),
+    ("edge_seams", "Seams along or through large openings",
+     "Two-direction splits: allow row seams along or through large openings.",
+     "Only used for parts split in both directions. On: row seams may run along the edges of "
+     "large rectangular openings or straight through large openings of any shape, keeping "
+     "Seam clearance from the opening's top and bottom; the app compares these against plain "
+     "strips and keeps the cheapest. Off: row seams always keep clear of openings."),
     ("avoid_notches", "Keep seams out of notches",
      "Seams avoid notches; inside corners are always protected.",
      "On: seams stay out of notches, meaning concave cut-outs shorter than 25% of the part "
@@ -1927,7 +2588,10 @@ HELP_QUICK = [
     ("2. Cost", "Set material, thickness, $/lb and weld $/ft. Check thickness every run."),
     ("3. Parts", "Add DXF... and pick part files. The Report / Log tab lists what was found in "
      "each file. Double-click a part to set quantity, outside profile only, rotation and "
-     "splitting. Use Duplicate to run the same DXF twice with different options."),
+     "splitting. Use Duplicate to run the same DXF twice with different options. 'Allow "
+     "splitting in both directions' (off by default) lets the app also try two-direction "
+     "splits and keep them only when cheaper; a part too big for every sheet in both "
+     "directions needs it ticked."),
     ("4. Optimize", "Press Optimize. The status bar shows the total and the Preview tab shows "
      "every sheet: black = outside cut, red = shared cut line, green = hole."),
     ("5. Review", "Read the Report / Log tab: cost summary, trade-off table and seam "
@@ -2055,6 +2719,7 @@ def run_gui(test_hook=None):
             self.v_prof = tk.BooleanVar(value=part.profile_only)
             self.v_rot = tk.BooleanVar(value=part.allow_rotate)
             self.v_split = tk.BooleanVar(value=part.allow_split)
+            self.v_2d = tk.BooleanVar(value=part.allow_2d)
             f = ttk.Frame(self, padding=10)
             f.pack(fill="both")
             ttk.Label(f, text="Name").grid(row=0, column=0, sticky="w")
@@ -2067,8 +2732,10 @@ def run_gui(test_hook=None):
                 row=3, column=0, columnspan=2, sticky="w")
             ttk.Checkbutton(f, text="Allow splitting into segments", variable=self.v_split).grid(
                 row=4, column=0, columnspan=2, sticky="w")
+            ttk.Checkbutton(f, text="Allow splitting in both directions (kept only when cheaper)",
+                            variable=self.v_2d).grid(row=5, column=0, columnspan=2, sticky="w")
             bf = ttk.Frame(f)
-            bf.grid(row=5, column=0, columnspan=2, pady=(8, 0))
+            bf.grid(row=6, column=0, columnspan=2, pady=(8, 0))
             ttk.Button(bf, text="OK", command=self._ok).pack(side="left", padx=4)
             ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=4)
             self.grab_set()
@@ -2085,6 +2752,7 @@ def run_gui(test_hook=None):
             p.profile_only = self.v_prof.get()
             p.allow_rotate = self.v_rot.get()
             p.allow_split = self.v_split.get()
+            p.allow_2d = self.v_2d.get()
             self.ok = True
             self.destroy()
 
@@ -2186,11 +2854,16 @@ def run_gui(test_hook=None):
             # sheets
             sf = ttk.LabelFrame(left, text="Stock sheets (W x L)", padding=4)
             sf.pack(fill="both", expand=True)
-            self.tv_sheets = ttk.Treeview(sf, columns=("on", "w", "l"), show="headings", height=9)
+            tf_ = ttk.Frame(sf)
+            tf_.pack(fill="both", expand=True)
+            self.tv_sheets = ttk.Treeview(tf_, columns=("on", "w", "l"), show="headings", height=6)
             for c, t, wd in (("on", "Use", 45), ("w", "Width", 70), ("l", "Length", 70)):
                 self.tv_sheets.heading(c, text=t)
                 self.tv_sheets.column(c, width=wd, anchor="center")
-            self.tv_sheets.pack(fill="both", expand=True)
+            ssb = ttk.Scrollbar(tf_, orient="vertical", command=self.tv_sheets.yview)
+            self.tv_sheets.configure(yscrollcommand=ssb.set)
+            self.tv_sheets.pack(side="left", fill="both", expand=True)
+            ssb.pack(side="right", fill="y")
             self.tv_sheets.bind("<Double-1>", lambda e: self._toggle_sheet())
             r = ttk.Frame(sf)
             r.pack(fill="x", pady=3)
@@ -2214,7 +2887,8 @@ def run_gui(test_hook=None):
                     ("seam_clear", "Seam clearance"), ("min_seg", "Min segment length"),
                     ("seam_step", "Seam rounding step"), ("flatten_tol", "Arc flatten tol."),
                     ("join_tol", "Endpoint join tol."), ("corner_clear", "Corner clearance"),
-                    ("effort", "Search effort"), ("max_seconds", "Time limit (s)")]
+                    ("effort", "Search effort"), ("max_seconds", "Time limit (s)"),
+                    ("min_stagger", "Min seam stagger"), ("opening_min", "Min opening, edge seams")]
             tips = {k: tip for k, _, tip, _ in HELP_SETTINGS + HELP_COST}
             self._tips = []
 
@@ -2230,6 +2904,9 @@ def run_gui(test_hook=None):
             self.v_notch = tk.BooleanVar(value=self.st.avoid_notches)
             tipped(ttk.Checkbutton(gf, text="Keep seams out of notches", variable=self.v_notch),
                    "avoid_notches").grid(row=len(rows), column=0, columnspan=2, sticky="w")
+            self.v_edge = tk.BooleanVar(value=self.st.edge_seams)
+            tipped(ttk.Checkbutton(gf, text="Seams along or through large openings", variable=self.v_edge),
+                   "edge_seams").grid(row=len(rows) + 1, column=0, columnspan=2, sticky="w")
 
             cf_ = ttk.LabelFrame(left, text="Cost (scores layouts in $)", padding=4)
             cf_.pack(fill="x", pady=(6, 0))
@@ -2261,7 +2938,7 @@ def run_gui(test_hook=None):
             cols = ("name", "qty", "size", "feat", "rot", "split", "file")
             self.tv_parts = ttk.Treeview(pf, columns=cols, show="headings", height=6)
             for c, t, wd in (("name", "Name", 170), ("qty", "Qty", 45), ("size", "Size", 150),
-                             ("feat", "Features", 120), ("rot", "Rotate", 55), ("split", "Split", 50),
+                             ("feat", "Features", 120), ("rot", "Rotate", 55), ("split", "Split", 75),
                              ("file", "File", 300)):
                 self.tv_parts.heading(c, text=t)
                 self.tv_parts.column(c, width=wd, anchor="w" if c in ("name", "file") else "center")
@@ -2354,7 +3031,8 @@ def run_gui(test_hook=None):
                 feat = "profile only" if p.profile_only else (f"{nf} feature(s)" if nf else "none")
                 self.tv_parts.insert("", "end", iid=str(i), values=(
                     p.name, p.qty, f"{w:.3f} x {h:.3f}", feat,
-                    "Yes" if p.allow_rotate else "No", "Yes" if p.allow_split else "No",
+                    "Yes" if p.allow_rotate else "No",
+                    ("Yes, 2-dir" if p.allow_2d else "Yes") if p.allow_split else "No",
                     os.path.basename(p.file)))
 
         def _log(self, s):
@@ -2395,7 +3073,8 @@ def run_gui(test_hook=None):
             p = self.parts[i]
             q = Part(name=p.name + " (copy)", file=p.file, outer=p.outer, inner=p.inner,
                      units=p.units, qty=p.qty, profile_only=p.profile_only,
-                     allow_rotate=p.allow_rotate, allow_split=p.allow_split, doc=p.doc)
+                     allow_rotate=p.allow_rotate, allow_split=p.allow_split,
+                     allow_2d=p.allow_2d, doc=p.doc)
             self.parts.insert(i + 1, q)
             self._refresh_parts()
 
@@ -2412,6 +3091,7 @@ def run_gui(test_hook=None):
                     cur = getattr(self.st, k)
                     setattr(self.st, k, type(cur)(float(v.get())) if isinstance(cur, int) else float(v.get()))
                 self.st.avoid_notches = self.v_notch.get()
+                self.st.edge_seams = self.v_edge.get()
                 if self.st.border < 0 or self.st.spacing < 0 or self.st.min_seg <= 0:
                     raise ValueError("border/spacing must be >= 0 and min segment > 0")
                 return True

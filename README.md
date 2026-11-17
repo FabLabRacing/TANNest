@@ -132,6 +132,7 @@ Double-click a part (or select it and press **Edit...**):
 | **Outside profile only** | Drops all internal features and cuts just the outline. |
 | **Allow 90 deg rotation** | Lets the packer turn the part sideways. It also lets a tall-and-narrow part be treated with its long side as the length. |
 | **Allow splitting into segments** | Lets an oversize part be cut into weldable segments. If this is off and the part doesn't fit any sheet, the run stops with an error. |
+| **Allow splitting in both directions** | Off by default; parts with it off are handled exactly as before. When ticked, the app also tries two-direction splits (row seams across the short side, then each row split as usual) and keeps one only when it lowers the total cost; a part too big for every sheet in both directions must have it ticked. Row seams may run along the edges of large rectangular openings or straight through large openings of any shape, so that part of the seam needs no weld. Cross seams meeting a row seam from either side are kept at least Min seam stagger apart. The report notes which parts were tried but stayed one direction. |
 
 **Same DXF, two versions** (for example, one wall with features and one without): add the DXF, select it, press **Duplicate**, then edit the copy. Give it a new name and check *Outside profile only*.
 
@@ -152,7 +153,10 @@ All lengths are in drawing units, which is normally inches.
 | Arc flatten tol. | 0.005 | Chord tolerance when an arc has to become a polyline (only on split segment outlines) |
 | Endpoint join tol. | 0.005 | How close two line ends must be to count as connected. Raise it slightly for sloppy drawings. |
 | Search effort | 400 | Base search effort. It is scaled up automatically with the number of parts and seam options, so big jobs get a more thorough search. Raise it if results change noticeably between runs. |
-| Time limit (s) | 60 | The search stops at this limit whatever the effort; the report notes it if that happened. |
+| Min seam stagger | 6.0 | Two-direction splits only: minimum offset between cross seams meeting a row seam from either side (and from the corners of openings formed between pieces). Set it from your weld practice. |
+| Min opening, edge seams | 12.0 | Two-direction splits only: openings at least this big in both directions may have a row seam through them (any shape) or along their top or bottom edge (rectangles). |
+| Seams along or through large openings | on | Two-direction splits only: allow row seams along the edges of large rectangular openings or through large openings of any shape (keeping Seam clearance from the opening's top and bottom). Off: row seams keep clear of openings. |
+| Time limit (s) | 60 | The search stops at this limit whatever the effort; the report notes it if that happened. With two-direction parts, about a third of the time screens the options one part at a time and the rest goes to the best one or two combinations. |
 | Keep seams out of notches | on | Seams stay out of notches: concave cut-outs shorter than 25% of the part's length. Longer concave areas (a narrowed middle section, long side reliefs) are treated as part of the shape, so only their corners are kept clear. If no layout can avoid a notch, seams may cross it but inside corners are still kept clear; only as a last resort are corners given up, with a warning. |
 
 Settings and the sheet list are saved when you close the app. The file is `.tannest.json` in your user folder.
@@ -193,6 +197,7 @@ The layout with the lowest total wins. Ties go to less sheet area, then fewer se
 | File | Contents |
 |---|---|
 | `Sheet01_72x144_WallA-S1.dxf`, ... | One file per sheet. Sheet origin is at the lower left (0,0); length runs along X. |
+| `SeamMap_<part>.dxf` (two-direction parts) | One map for the whole part: row seams, cross seams, openings formed between pieces (reference outline on `SEAM_REF`), and every piece labeled with its sheet |
 | `SeamMap_<part>.dxf` | Each split part in its original coordinates, with seam lines, seam labels, and each piece labeled with the sheet it comes from (all on `SEAM_REF`) |
 | `Nest_Report.txt` | The same report shown in the Report / Log tab |
 | `Assembly_Map.pdf` | For the shop floor: each split part as drawn in its DXF, with numbered seams and every piece tagged with its name and sheet number, plus a piece table (sheet, cut file, size) and a seam table (location, weld length, which pieces it joins). One page per copy of each split part, then a list of parts cut whole and their sheets. |
@@ -258,7 +263,7 @@ Saving a SheetCam job template with these three layer operations makes every TAN
 ## Limitations
 
 - **Rectangular nesting.** Parts are packed by bounding box at 0 or 90 degrees. There is no true-shape nesting, and small parts are never placed inside openings or between irregular edges. Irregular parts (triangles, rings, L-shapes) waste more than a true-shape nester would.
-- **One split direction.** Seams are perpendicular to a part's long axis only. A part too wide for every sheet in both directions can't be split and stops the run.
+- **Two-direction splitting is opt-in per part.** Without it, seams run perpendicular to a part's long axis only, and a part too wide for every sheet in both directions stops the run. With it, row seams run across the short side and cross seams along each row; seams are always straight lines.
 - **Straight seams only.** No stepped or puzzle joints.
 - **Heuristic search.** The search is fast and usually very good, but it can't prove it found the absolute best layout. If a result looks off, raise Search effort or compare against the trade-off table.
 - **Flat costs.** Each sheet size has the same $/lb, and weld cost is the same per foot regardless of position or orientation.
